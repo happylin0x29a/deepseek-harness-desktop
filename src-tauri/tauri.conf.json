@@ -33,6 +33,16 @@
       "icons/128x128@2x.png",
       "icons/icon.ico",
       "icons/icon.icns"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "languages": [
+          "SimpChinese"
+        ]
+      },
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
   }
 }
