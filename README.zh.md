@@ -6,9 +6,9 @@ DeepSeek Harness 的桌面外壳：一个 Tauri 2 应用，启动 `dsh desktop`�
 
 ## 工作原理
 
-1. 外壳立即打开一个小型加载窗口，启动 `dsh desktop`（二进制来自 `DSH_BIN`，默认 `dsh`；额外参数来自 `DSH_DESKTOP_ARGS`），并把启动状态流式显示在窗口里（启动宿主 → 等待服务器 → 打开界面）。Windows 上子进程以 `CREATE_NO_WINDOW` 运行，应用旁不会出现控制台窗口。
+1. 外壳立即打开一个小型加载窗口，启动 `dsh desktop`（二进制来自 `DSH_BIN`，默认 `dsh`；额外参数来自 `DSH_DESKTOP_ARGS`），并把启动状态流式显示在窗口里（启动宿主 → 等待服务器 → 打开界面）；同一阶段也会同步到窗口标题栏，页面加载前就能看到进度。Windows 上子进程以 `CREATE_NO_WINDOW` 运行，应用旁不会出现控制台窗口。
 2. web runtime 在其 Loader 树稳定后打印 `dsh web: http://127.0.0.1:PORT`；外壳解析该行（两种标签均可）。
-3. URL 到达后，加载窗口放大到完整尺寸并直接落在那条界面上——没有选择步骤，也没有 IPC。宿主退出且未发布 URL 时，失败原因会保留在加载窗口上。
+3. URL 到达后，加载窗口放大到完整尺寸并直接落在那条界面上——没有选择步骤，界面也不做 IPC。宿主启动失败、退出且未发布 URL、或超过就绪超时（`DSH_READY_TIMEOUT_MS`，默认 120 秒）时，原因（含宿主最近的 stderr）会保留在加载窗口上，完整时间线写入 `%TEMP%\dsh-desktop.log`。
 4. 外壳退出时，被启动的宿主进程会被终止。
 
 ## 图标
@@ -28,7 +28,7 @@ DeepSeek Harness 的桌面外壳：一个 Tauri 2 应用，启动 `dsh desktop`�
 pnpm tauri dev
 
 # source checkout: point the shell at the built CLI (relative to this directory)
-$env:DSH_BIN = "node <deepseek-harness-checkout>\apps\cli\lib\bin.js"
+$env:DSH_BIN = "node ..\apps\cli\lib\bin.js"
 $env:DSH_DESKTOP_ARGS = "--port 8080"   # optional
 pnpm tauri dev
 

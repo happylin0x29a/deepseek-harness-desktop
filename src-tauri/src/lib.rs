@@ -10,20 +10,35 @@
 //! the loading window. On Windows the host child runs windowless
 //! (`CREATE_NO_WINDOW`), so no console window appears beside the app.
 
-use std::io::{BufRead, BufReader};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, LogicalSize, Manager, Size, Url, WebviewWindow};
 
 /// Ask `CreateProcess` to attach no console window to the host child.
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The shell's shared state: the spawned host process and the startup error
-/// (kept so the loading page can read it without racing the event stream).
+/// How long the shell waits for the host's readiness line before giving up.
+fn ready_timeout() -> Duration {
+    let millis = std::env::var("DSH_READY_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(120_000);
+    Duration::from_millis(millis)
+}
+
+/// The shell's shared state: the spawned host process, the current startup
+/// phase, the recorded failure, and the host's recent stderr (kept so the
+/// loading page can read everything without racing the event stream).
 struct DesktopState {
     child: Mutex<Option<Child>>,
+    phase: Mutex<String>,
     error: Mutex<Option<String>>,
+    stderr_tail: Mutex<String>,
+    ready: Mutex<bool>,
 }
 
 /// Killing the host on drop keeps no orphan server behind the window.
@@ -36,6 +51,21 @@ impl Drop for DesktopState {
             }
         }
     }
+}
+
+/// Append one line to the shell log (temp dir), with a timestamp. The log is
+/// the support surface when the window itself cannot show progress.
+fn log_line(line: &str) {
+    let path = std::env::temp_dir().join("dsh-desktop.log");
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{millis} {line}");
+    }
+}
+
+/// Where the shell log lives — shown in failure messages.
+fn log_path() -> String {
+    std::env::temp_dir().join("dsh-desktop.log").to_string_lossy().into_owned()
 }
 
 /// The readiness-line contract: `dsh web:` or `dsh desktop:`, then the
@@ -79,18 +109,14 @@ fn host_command() -> (String, Vec<String>) {
     (program, parts.map(str::to_string).collect())
 }
 
-/// Publish one startup-progress state to the loading window.
-fn emit_state(app: &tauri::AppHandle, state: &str) {
-    let _ = app.emit("startup-state", state);
-}
-
 /// Record the startup failure and keep it visible: the loading window stays
 /// open with the reason instead of the process dying silently.
 fn fail_startup(app: &tauri::AppHandle, message: &str) {
     if let Some(state) = app.try_state::<DesktopState>() {
         *state.error.lock().expect("desktop: error mutex poisoned") = Some(message.to_string());
     }
-    emit_state(app, message);
+    set_phase(app, message);
+    log_line(&format!("startup failed: {message}"));
 }
 
 /// Grow the loading window to its full size and open the surface on it.
@@ -100,34 +126,45 @@ fn open_surface(window: &WebviewWindow, url: &str) {
         || window.set_min_size(Some(LogicalSize::new(960.0, 600.0))).is_err()
         || window.center().is_err()
         || window.navigate(parsed).is_err() {
-        eprintln!("desktop: failed to grow or navigate the main window")
+        log_line("failed to grow or navigate the main window")
     }
 }
 
+/// Advance the startup phase: stored state, window title (visible in the
+/// taskbar without any page IPC), and the loading-page event.
+fn set_phase(app: &tauri::AppHandle, phase: &str) {
+    log_line(&format!("phase: {phase}"));
+    if let Some(state) = app.try_state::<DesktopState>() {
+        *state.phase.lock().expect("desktop: phase mutex poisoned") = phase.to_string();
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_title(&format!("DeepSeek Harness — {phase}"));
+    }
+    let _ = app.emit("startup-state", phase);
+}
+
 /// Spawn `dsh desktop` windowless and stream startup progress; once its
-/// readiness URL arrives the window grows onto the surface, and a host that
-/// exits without one keeps the failure reason on the loading window.
+/// readiness URL arrives the window grows onto the surface. A spawn failure,
+/// a host that exits without publishing, or a readiness timeout keeps the
+/// reason (plus the host's recent stderr) on the loading window.
 fn spawn_host(state: &DesktopState, app: tauri::AppHandle) {
-    emit_state(&app, "正在启动宿主进程…");
+    set_phase(&app, "正在启动宿主进程…");
+    log_line(&format!("host command: {} desktop {}", host_bin(), extra_host_args().join(" ")));
     let (program, leading_args) = host_command();
     let mut command = Command::new(program);
     command
         .args(leading_args)
         .arg("desktop")
         .args(extra_host_args())
-        .stdout(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         // The host is a console-subsystem program (node): without the flag
         // Windows would open a black console window beside the app. Its
-        // stderr has nowhere useful to go windowless, so drop it.
+        // stderr is piped above and lands in the shell log instead.
         command.creation_flags(CREATE_NO_WINDOW);
-        command.stderr(Stdio::null());
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        command.stderr(Stdio::inherit());
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -139,47 +176,123 @@ fn spawn_host(state: &DesktopState, app: tauri::AppHandle) {
         }
     };
     let stdout = child.stdout.take().expect("desktop: host stdout is not piped");
+    let stderr = child.stderr.take().expect("desktop: host stderr is not piped");
     *state.child.lock().expect("desktop: child mutex poisoned") = Some(child);
-    emit_state(&app, "正在等待服务器就绪…");
+    set_phase(&app, "正在等待服务器就绪…");
+    // Keep the host's recent stderr for failure messages.
+    let stderr_app = app.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { continue };
+            log_line(&format!("host stderr: {line}"));
+            if let Some(state) = stderr_app.try_state::<DesktopState>() {
+                let mut tail = state.stderr_tail.lock().expect("desktop: stderr mutex poisoned");
+                tail.push_str(&line);
+                tail.push('\n');
+                if tail.len() > 4000 {
+                    let cut = tail.len() - 2000;
+                    let drained = tail.split_off(cut);
+                    *tail = drained;
+                }
+            }
+        }
+    });
+    // Readiness watchdog: after the timeout, a silent host fails visibly.
+    let timeout_app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(ready_timeout());
+        if let Some(state) = timeout_app.try_state::<DesktopState>() {
+            let ready = *state.ready.lock().expect("desktop: ready mutex poisoned");
+            if !ready {
+                fail_startup(&timeout_app, &format!(
+                    "启动超时:宿主在 {} 秒内没有就绪。原因见宿主日志,或查看 {}。",
+                    ready_timeout().as_secs(),
+                    log_path(),
+                ));
+            }
+        }
+    });
+    // The stdout reader: readiness line → grow onto the surface.
     std::thread::spawn(move || {
         let mut published = false;
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { continue };
+            log_line(&format!("host stdout: {line}"));
             if let Some(url) = parse_url_line(&line) {
                 if !is_local_web_url(&url) {
                     continue;
                 }
                 published = true;
+                if let Some(state) = app.try_state::<DesktopState>() {
+                    *state.ready.lock().expect("desktop: ready mutex poisoned") = true;
+                }
                 if let Some(window) = app.get_webview_window("main") {
-                    emit_state(&app, "正在打开界面…");
+                    set_phase(&app, "正在打开界面…");
                     open_surface(&window, &url);
                 }
                 break;
             }
         }
         if !published {
-            fail_startup(&app, "启动失败:宿主进程已退出且未发布服务器地址。请确认 dsh 安装正常后重试。");
+            let ready = app.try_state::<DesktopState>()
+                .map(|state| *state.ready.lock().expect("desktop: ready mutex poisoned"))
+                .unwrap_or(false);
+            if !ready {
+                let tail = app.try_state::<DesktopState>()
+                    .map(|state| state.stderr_tail.lock().expect("desktop: stderr mutex poisoned").clone())
+                    .unwrap_or_default();
+                fail_startup(&app, &format!(
+                    "启动失败:宿主进程已退出且未发布服务器地址。{}",
+                    if tail.is_empty() {
+                        format!("详情见日志 {}。", log_path())
+                    } else {
+                        format!("宿主输出:\n{tail}")
+                    },
+                ));
+            }
         }
     });
 }
 
-/// The recorded startup error, or null while starting. The loading page asks
-/// once on load so an early failure is never missed by the event listener.
+/// The startup progress snapshot the loading page polls: current phase,
+/// recorded failure, and the host's recent stderr.
 #[tauri::command]
-fn startup_error(state: tauri::State<'_, DesktopState>) -> Option<String> {
-    state.error.lock().expect("desktop: error mutex poisoned").clone()
+fn startup_status(state: tauri::State<'_, DesktopState>) -> StartupStatus {
+    StartupStatus {
+        phase: state.phase.lock().expect("desktop: phase mutex poisoned").clone(),
+        error: state.error.lock().expect("desktop: error mutex poisoned").clone(),
+        stderr_tail: state.stderr_tail.lock().expect("desktop: stderr mutex poisoned").clone(),
+        log_path: log_path(),
+    }
+}
+
+/// The polling contract between the shell and the loading page.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupStatus {
+    phase: String,
+    error: Option<String>,
+    stderr_tail: String,
+    log_path: String,
 }
 
 /// Build and run the desktop shell.
 pub fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
-            let state = DesktopState { child: Mutex::new(None), error: Mutex::new(None) };
+            log_line(&format!("shell starting, log at {}", log_path()));
+            let state = DesktopState {
+                child: Mutex::new(None),
+                phase: Mutex::new("正在启动…".to_string()),
+                error: Mutex::new(None),
+                stderr_tail: Mutex::new(String::new()),
+                ready: Mutex::new(false),
+            };
             spawn_host(&state, app.handle().clone());
             app.manage(state);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![startup_error])
+        .invoke_handler(tauri::generate_handler![startup_status])
         .build(tauri::generate_context!())
         .expect("error while building the desktop shell");
     app.run(|handle, event| {

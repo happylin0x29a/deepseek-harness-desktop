@@ -6,9 +6,9 @@ The desktop shell for DeepSeek Harness: a Tauri 2 application that spawns `dsh d
 
 ## How it works
 
-1. The shell opens a small loading window immediately, spawns `dsh desktop` (binary from `DSH_BIN`, default `dsh`; extra args from `DSH_DESKTOP_ARGS`) and streams startup states into it (starting the host → waiting for the server → opening the surface). On Windows the child runs with `CREATE_NO_WINDOW`, so no console window appears beside the app.
+1. The shell opens a small loading window immediately, spawns `dsh desktop` (binary from `DSH_BIN`, default `dsh`; extra args from `DSH_DESKTOP_ARGS`) and streams startup states into it (starting the host → waiting for the server → opening the surface); the same phase is mirrored in the window title, so progress is visible even before the page loads. On Windows the child runs with `CREATE_NO_WINDOW`, so no console window appears beside the app.
 2. The web runtime prints `dsh web: http://127.0.0.1:PORT` once its Loader tree settles; the shell parses it (either label).
-3. Once the URL arrives the loading window grows to its full size and opens directly on that surface — no choice step, and no IPC. A host that exits without publishing a URL keeps the failure reason on the loading window.
+3. Once the URL arrives the loading window grows to its full size and opens directly on that surface — no choice step, and no IPC from the surface. A host that fails to spawn, exits without publishing a URL, or misses the readiness timeout (`DSH_READY_TIMEOUT_MS`, default 120 s) keeps the reason — including the host's recent stderr — on the loading window, and a full timeline is appended to `%TEMP%\dsh-desktop.log`.
 4. When the shell exits, the spawned host is killed.
 
 ## Icons
@@ -28,7 +28,7 @@ The whale icon is rendered from the repository favicon (`apps/web/public/favicon
 pnpm tauri dev
 
 # source checkout: point the shell at the built CLI (relative to this directory)
-$env:DSH_BIN = "node <deepseek-harness-checkout>\apps\cli\lib\bin.js"
+$env:DSH_BIN = "node ..\apps\cli\lib\bin.js"
 $env:DSH_DESKTOP_ARGS = "--port 8080"   # optional
 pnpm tauri dev
 

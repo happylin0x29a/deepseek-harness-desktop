@@ -16,26 +16,26 @@ body {
 
 main {
   text-align: center;
-  max-width: 24rem;
-  padding: 2rem;
+  max-width: 26rem;
+  padding: 1.5rem;
 }
 
 #logo {
-  width: 64px;
-  height: 64px;
-  margin-bottom: 0.75rem;
+  width: 56px;
+  height: 56px;
+  margin-bottom: 0.6rem;
 }
 
 h1 {
-  font-size: 1.1rem;
+  font-size: 1.05rem;
   font-weight: 600;
-  margin: 0 0 1rem;
+  margin: 0 0 0.8rem;
 }
 
 #spinner {
-  width: 28px;
-  height: 28px;
-  margin: 0 auto 1rem;
+  width: 26px;
+  height: 26px;
+  margin: 0 auto 0.8rem;
   border: 3px solid #2a313b;
   border-top-color: #e6e8eb;
   border-radius: 50%;
@@ -51,4 +51,18 @@ h1 {
 #status {
   color: #9aa3ad;
   margin: 0;
+}
+
+#detail {
+  margin: 0.8rem 0 0;
+  padding: 0.6rem;
+  max-height: 9rem;
+  overflow: auto;
+  text-align: left;
+  white-space: pre-wrap;
+  font-size: 0.78rem;
+  color: #c9a6a6;
+  background: #171c22;
+  border: 1px solid #2a313b;
+  border-radius: 0.4rem;
 }
