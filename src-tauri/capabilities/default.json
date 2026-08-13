@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities for the local splash page: core events and window APIs only; the remote surface page performs no IPC.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

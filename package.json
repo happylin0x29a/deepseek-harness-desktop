@@ -1,0 +1,14 @@
+{
+  "name": "dsh-desktop-shell",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tauri desktop shell for DeepSeek Harness: spawns `dsh desktop` and shows the web surface in a native window",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

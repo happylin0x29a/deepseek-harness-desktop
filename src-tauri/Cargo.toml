@@ -1,0 +1,16 @@
+[package]
+name = "dsh-desktop"
+version = "0.1.0"
+description = "DeepSeek Harness desktop shell: spawns `dsh desktop` and shows the web surface in a native window"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "dsh_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }

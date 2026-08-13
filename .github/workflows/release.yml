@@ -1,0 +1,59 @@
+name: release
+
+# Builds the DeepSeek Harness desktop installers on tag pushes (v*) and
+# manual runs: Windows x64 (NSIS + MSI) and macOS Apple Silicon (DMG + app).
+# The runtime expects `dsh` on PATH (or DSH_BIN set) — the shell spawns
+# `dsh desktop` as the host.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: '--bundles nsis,msi'
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin --bundles dmg,app'
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # macOS builds cross-compile to Apple Silicon, so every runner needs
+          # the aarch64-apple-darwin target installed.
+          targets: aarch64-apple-darwin
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'DeepSeek Harness Desktop v__VERSION__'
+          releaseBody: 'See the assets to download this release.'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
