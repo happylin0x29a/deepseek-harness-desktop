@@ -54,6 +54,6 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'DeepSeek Harness Desktop v__VERSION__'
           releaseBody: 'See the assets to download this release.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

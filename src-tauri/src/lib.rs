@@ -19,9 +19,11 @@ use tauri::{Emitter, LogicalSize, Manager, Size, Url, WebviewWindow};
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The shell's shared state: the spawned host process.
+/// The shell's shared state: the spawned host process and the startup error
+/// (kept so the loading page can read it without racing the event stream).
 struct DesktopState {
     child: Mutex<Option<Child>>,
+    error: Mutex<Option<String>>,
 }
 
 /// Killing the host on drop keeps no orphan server behind the window.
@@ -82,6 +84,15 @@ fn emit_state(app: &tauri::AppHandle, state: &str) {
     let _ = app.emit("startup-state", state);
 }
 
+/// Record the startup failure and keep it visible: the loading window stays
+/// open with the reason instead of the process dying silently.
+fn fail_startup(app: &tauri::AppHandle, message: &str) {
+    if let Some(state) = app.try_state::<DesktopState>() {
+        *state.error.lock().expect("desktop: error mutex poisoned") = Some(message.to_string());
+    }
+    emit_state(app, message);
+}
+
 /// Grow the loading window to its full size and open the surface on it.
 fn open_surface(window: &WebviewWindow, url: &str) {
     let parsed = Url::parse(url).expect("desktop: readiness URL is not a valid URL");
@@ -118,7 +129,15 @@ fn spawn_host(state: &DesktopState, app: tauri::AppHandle) {
     {
         command.stderr(Stdio::inherit());
     }
-    let mut child = command.spawn().expect("desktop: failed to spawn the dsh host");
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            fail_startup(&app, &format!(
+                "启动失败:找不到 dsh。请先安装 @deepseek-ai/dsh(npm i -g @deepseek-ai/dsh),或设置 DSH_BIN 环境变量指向它。({error})",
+            ));
+            return;
+        }
+    };
     let stdout = child.stdout.take().expect("desktop: host stdout is not piped");
     *state.child.lock().expect("desktop: child mutex poisoned") = Some(child);
     emit_state(&app, "正在等待服务器就绪…");
@@ -139,20 +158,28 @@ fn spawn_host(state: &DesktopState, app: tauri::AppHandle) {
             }
         }
         if !published {
-            emit_state(&app, "启动失败：请确认 dsh 已安装并位于 PATH（或设置 DSH_BIN 环境变量）后重试。");
+            fail_startup(&app, "启动失败:宿主进程已退出且未发布服务器地址。请确认 dsh 安装正常后重试。");
         }
     });
+}
+
+/// The recorded startup error, or null while starting. The loading page asks
+/// once on load so an early failure is never missed by the event listener.
+#[tauri::command]
+fn startup_error(state: tauri::State<'_, DesktopState>) -> Option<String> {
+    state.error.lock().expect("desktop: error mutex poisoned").clone()
 }
 
 /// Build and run the desktop shell.
 pub fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
-            let state = DesktopState { child: Mutex::new(None) };
+            let state = DesktopState { child: Mutex::new(None), error: Mutex::new(None) };
             spawn_host(&state, app.handle().clone());
             app.manage(state);
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![startup_error])
         .build(tauri::generate_context!())
         .expect("error while building the desktop shell");
     app.run(|handle, event| {
