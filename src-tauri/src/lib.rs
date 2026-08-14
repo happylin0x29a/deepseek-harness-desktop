@@ -574,11 +574,6 @@ fn dir_stats(dir: &Path) -> (u64, u64) {
     (bytes, files)
 }
 
-/// Recursive byte size of a directory tree (0 when absent).
-fn dir_size(dir: &Path) -> u64 {
-    dir_stats(dir).0
-}
-
 /// Number of packages in a node_modules dir: immediate subdirectories, plus
 /// the subdirectories of every `@`-scoped directory (each scope nests its
 /// packages).
@@ -1230,11 +1225,11 @@ mod tests {
         fs::write(root.join("one.bin"), vec![1u8; 100]).unwrap();
         fs::write(root.join("a/two.bin"), vec![2u8; 250]).unwrap();
         fs::write(root.join("a/b/three.bin"), vec![3u8; 40]).unwrap();
-        assert_eq!(dir_size(&root), 390);
+        assert_eq!(dir_stats(&root).0, 390);
         assert_eq!(count_directories(&root), 4); // a + @scope + its two packages
         assert_eq!(count_directories(&root.join("a")), 1);
         assert_eq!(count_directories(&root.join("@scope")), 2);
-        assert_eq!(dir_size(&root.join("missing")), 0);
+        assert_eq!(dir_stats(&root.join("missing")).0, 0);
         assert_eq!(count_directories(&root.join("missing")), 0);
         fs::remove_dir_all(&root).ok();
     }
