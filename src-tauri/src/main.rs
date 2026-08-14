@@ -1,5 +1,7 @@
-// Prevents an additional console window on Windows in release, DO NOT REMOVE!!
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// GUI subsystem on Windows for every build: no console window beside the
+// app, in debug or release. The shell's own logging goes to the log file
+// (%TEMP%\dsh-desktop.log), so the console is not needed for diagnostics.
+#![windows_subsystem = "windows"]
 
 fn main() {
     dsh_desktop_lib::run()
