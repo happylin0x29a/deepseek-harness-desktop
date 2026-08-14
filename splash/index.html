@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <title>DeepSeek Harness</title>
@@ -9,8 +9,13 @@
     <main>
       <img id="logo" src="logo.png" alt="" />
       <h1>DeepSeek Harness</h1>
-      <div id="spinner" aria-hidden="true"></div>
       <p id="status">正在启动…</p>
+      <div id="spinner" aria-hidden="true"></div>
+      <div id="progress" hidden>
+        <div class="progress-track"><div id="progress-fill"></div></div>
+        <span id="progress-pct"></span>
+      </div>
+      <p id="hint">首次启动如未检测到 dsh，将自动从国内镜像下载运行时（约 350 MB），请耐心等待。</p>
       <pre id="detail" hidden></pre>
     </main>
     <script src="splash.js"></script>
