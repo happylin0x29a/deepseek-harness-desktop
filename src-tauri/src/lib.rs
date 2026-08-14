@@ -81,6 +81,7 @@ struct DesktopState {
     progress: Mutex<Option<DownloadProgress>>,
     installing: Mutex<bool>,
     npm_progress: Mutex<Option<NpmProgress>>,
+    port_retried: Mutex<bool>,
 }
 
 /// Bytes downloaded so far out of the expected total, while the bootstrap
@@ -845,18 +846,66 @@ fn set_phase(app: &tauri::AppHandle, phase: &str) {
     let _ = app.emit("startup-state", phase);
 }
 
-/// Extra `dsh` arguments from `DSH_DESKTOP_ARGS` (whitespace-split), for
-/// example `--port 8080`.
-fn extra_host_args() -> Vec<String> {
-    std::env::var("DSH_DESKTOP_ARGS")
+/// The fingerprint of a dsh web response: the injected boot manifest that
+/// only the dsh host serves.
+fn looks_like_dsh(response_head: &str) -> bool {
+    response_head.contains("__DSH_BOOT__")
+}
+
+/// Whether a dsh web service already answers on the loopback port, meaning
+/// the shell can reuse it instead of spawning a second host (which would die
+/// on EADDRINUSE).
+fn probe_existing_service(port: u16) -> bool {
+    use std::io::{Read as _, Write as _};
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(2),
+    ) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 4096];
+    let read = stream.read(&mut buf).unwrap_or(0);
+    looks_like_dsh(&String::from_utf8_lossy(&buf[..read]))
+}
+
+/// The port `dsh web` will listen on: `--port` from `DSH_DESKTOP_ARGS`, else
+/// the dsh default (3080).
+fn configured_port() -> u16 {
+    let args = std::env::var("DSH_DESKTOP_ARGS").unwrap_or_default();
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if let Some(position) = parts.iter().position(|part| *part == "--port") {
+        if let Some(raw) = parts.get(position + 1) {
+            if let Ok(port) = raw.parse::<u16>() {
+                return port;
+            }
+        }
+    }
+    3080
+}
+
+/// Extra `dsh` arguments from `DSH_DESKTOP_ARGS` (whitespace-split), plus a
+/// random-port override when the host retries after EADDRINUSE.
+fn extra_host_args(retry_port: bool) -> Vec<String> {
+    let mut args: Vec<String> = std::env::var("DSH_DESKTOP_ARGS")
         .map(|raw| raw.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if retry_port {
+        args.extend(["--port".to_string(), "0".to_string()]);
+    }
+    args
 }
 
 /// Spawn the resolved host invocation (`… web …`), stream its stderr into the
-/// log, and open the surface when the readiness line arrives.
-fn spawn_and_stream(app: &tauri::AppHandle, program: String, leading_args: Vec<String>) {
-    let log_cmd = [program.clone(), leading_args.join(" "), "web".to_string(), extra_host_args().join(" ")]
+/// log, and open the surface when the readiness line arrives. With
+/// `retry_port` the host is started on a random port (after an EADDRINUSE).
+fn spawn_and_stream(app: &tauri::AppHandle, program: String, leading_args: Vec<String>, retry_port: bool) {
+    let log_cmd = [program.clone(), leading_args.join(" "), "web".to_string(), extra_host_args(retry_port).join(" ")]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
@@ -867,7 +916,7 @@ fn spawn_and_stream(app: &tauri::AppHandle, program: String, leading_args: Vec<S
     command
         .args(leading_args)
         .arg("web")
-        .args(extra_host_args())
+        .args(extra_host_args(retry_port))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
@@ -942,6 +991,30 @@ fn spawn_and_stream(app: &tauri::AppHandle, program: String, leading_args: Vec<S
                 let tail = stdout_app.try_state::<DesktopState>()
                     .map(|state| state.stderr_tail.lock().expect("desktop: stderr mutex poisoned").clone())
                     .unwrap_or_default();
+                // Another instance grabbed the port between the reuse probe
+                // and the bind: restart the host on a random port instead of
+                // failing the startup.
+                let already_retried = stdout_app.try_state::<DesktopState>()
+                    .map(|state| *state.port_retried.lock().expect("desktop: port_retried mutex poisoned"))
+                    .unwrap_or(true);
+                if !already_retried && tail.contains("EADDRINUSE") {
+                    if let Some(state) = stdout_app.try_state::<DesktopState>() {
+                        *state.port_retried.lock().expect("desktop: port_retried mutex poisoned") = true;
+                        *state.stderr_tail.lock().expect("desktop: stderr mutex poisoned") = String::new();
+                    }
+                    set_phase(&stdout_app, "端口被占用，正在改用随机端口…");
+                    log_line("EADDRINUSE; retrying host with --port 0");
+                    let retry_app = stdout_app.clone();
+                    std::thread::spawn(move || {
+                        match resolve_host_invocation(&retry_app) {
+                            Ok((program, leading_args)) => {
+                                spawn_and_stream(&retry_app, program, leading_args, true);
+                            }
+                            Err(message) => fail_startup(&retry_app, &message),
+                        }
+                    });
+                    return;
+                }
                 fail_startup(&stdout_app, &format!(
                     "启动失败:宿主进程已退出且未发布服务器地址。{}",
                     if tail.is_empty() {
@@ -955,12 +1028,30 @@ fn spawn_and_stream(app: &tauri::AppHandle, program: String, leading_args: Vec<S
     });
 }
 
-/// Start the host: resolve the invocation (which may bootstrap the runtime on
-/// first run) on a worker thread, then stream readiness to the window. A
-/// watchdog fails the startup visibly: the bootstrap phase gets its own
-/// budget, and the host phase gets `ready_timeout` once the host has spawned.
+/// Start the host: reuse an already-running dsh service on the configured
+/// port when one answers, otherwise resolve the invocation (which may
+/// bootstrap the runtime on first run) on a worker thread and stream
+/// readiness to the window. A watchdog fails the startup visibly: the
+/// bootstrap phase gets its own budget, and the host phase gets
+/// `ready_timeout` once the host has spawned.
 fn spawn_host(app: &tauri::AppHandle) {
     set_phase(app, "正在启动宿主进程…");
+    // Reuse instead of duplicate: a dsh service already answering on the
+    // configured port is the same surface; spawning a second host would die
+    // on EADDRINUSE. The reused service is not owned, so closing the window
+    // must not kill it.
+    let port = configured_port();
+    if probe_existing_service(port) {
+        set_phase(app, "检测到正在运行的 dsh 服务，正在连接…");
+        log_line(&format!("reusing existing dsh service on port {port}"));
+        if let Some(state) = app.try_state::<DesktopState>() {
+            *state.ready.lock().expect("desktop: ready mutex poisoned") = true;
+        }
+        if let Some(window) = app.get_webview_window("main") {
+            open_surface(&window, &format!("http://127.0.0.1:{port}"));
+        }
+        return;
+    }
     let watchdog_app = app.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -999,7 +1090,7 @@ fn spawn_host(app: &tauri::AppHandle) {
     let resolve_app = app.clone();
     std::thread::spawn(move || {
         match resolve_host_invocation(&resolve_app) {
-            Ok((program, leading_args)) => spawn_and_stream(&resolve_app, program, leading_args),
+            Ok((program, leading_args)) => spawn_and_stream(&resolve_app, program, leading_args, false),
             Err(message) => fail_startup(&resolve_app, &message),
         }
     });
@@ -1048,6 +1139,7 @@ pub fn run() {
                 progress: Mutex::new(None),
                 installing: Mutex::new(false),
                 npm_progress: Mutex::new(None),
+                port_retried: Mutex::new(false),
             });
             spawn_host(app.handle());
             Ok(())
@@ -1214,6 +1306,28 @@ mod tests {
         );
         assert_eq!(redact_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
         assert_eq!(redact_proxy("socks5://a:b@proxy.example:1080"), "***@proxy.example:1080");
+    }
+
+    #[test]
+    fn dsh_fingerprint_matches_only_the_boot_manifest() {
+        assert!(looks_like_dsh("<!doctype html><script>window.__DSH_BOOT__ = {\"rev\":\"abc\"}"));
+        assert!(looks_like_dsh("__DSH_BOOT__"));
+        assert!(!looks_like_dsh("<html><head><title>Other App</title>"));
+        assert!(!looks_like_dsh(""));
+    }
+
+    #[test]
+    fn configured_port_reads_dsh_desktop_args() {
+        let old = std::env::var_os("DSH_DESKTOP_ARGS");
+        std::env::set_var("DSH_DESKTOP_ARGS", "--port 8080");
+        assert_eq!(configured_port(), 8080);
+        std::env::set_var("DSH_DESKTOP_ARGS", "web --port=8081");
+        assert_eq!(configured_port(), 3080); // only the `--port <n>` form
+        std::env::remove_var("DSH_DESKTOP_ARGS");
+        assert_eq!(configured_port(), 3080);
+        if let Some(old) = old {
+            std::env::set_var("DSH_DESKTOP_ARGS", old);
+        }
     }
 
     #[test]
