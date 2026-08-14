@@ -1,9 +1,10 @@
 name: release
 
 # Builds the DeepSeek Harness desktop installers on tag pushes (v*) and
-# manual runs: Windows x64 (NSIS + MSI) and macOS Apple Silicon (DMG + app).
-# The runtime expects `dsh` on PATH (or DSH_BIN set) — the shell spawns
-# `dsh desktop` as the host.
+# manual runs: Windows x64 (NSIS + MSI), macOS Apple Silicon and Intel
+# (DMG + app). The shell spawns `dsh web` as the host; on first run it
+# bootstraps the pinned Node + dsh runtime from the domestic mirrors
+# (npmmirror) when no `dsh` is on PATH and DSH_BIN is unset.
 
 on:
   push:
@@ -24,6 +25,8 @@ jobs:
             args: '--bundles nsis,msi'
           - platform: macos-latest
             args: '--target aarch64-apple-darwin --bundles dmg,app'
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin --bundles dmg,app'
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -39,9 +42,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # macOS builds cross-compile to Apple Silicon, so every runner needs
-          # the aarch64-apple-darwin target installed.
-          targets: aarch64-apple-darwin
+          # macOS builds cross-compile (arm64 runners build Intel and vice
+          # versa), so every runner needs both Apple targets installed.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
