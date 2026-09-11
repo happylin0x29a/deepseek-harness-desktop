@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.4"
+version = "0.1.7"
 description = "DeepSeek Harness desktop shell: spawns `dsh web` (bootstrapping the runtime from domestic mirrors on first run) and shows the web surface in a native window"
 edition = "2021"
 license = "MIT"
@@ -20,3 +20,14 @@ zip = "4"
 tar = "0.4"
 flate2 = "1"
 sha2 = "0.10"
+# Attaching to a `dsh web` the user already started: its browser-session cookie
+# is `v1.<base64url body>.<base64url HMAC-SHA256>`, exactly as
+# `@deepseek-ai/dsh-client-connection` mints it.
+hmac = "0.12"
+base64 = "0.22"
+
+# Reading the machine/user PATH from the registry: a process launched from a
+# desktop or Start-menu shortcut inherits Explorer's environment snapshot, so
+# the inherited PATH alone can hide an installed Node.js.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

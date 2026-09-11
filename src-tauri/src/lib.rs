@@ -11,10 +11,17 @@
 //! no console window appears beside the app.
 //!
 //! The host resolution order is: `DSH_BIN` (development override), a `dsh`
-//! already on `PATH`, then a first-run bootstrap that downloads a pinned
-//! Node.js runtime and installs `@deepseek-ai/dsh` from the configured
-//! mirrors (domestic China mirrors by default) into the app-data runtime
-//! directory, and runs the host from there.
+//! already on `PATH`, then a first-run bootstrap that reuses the system
+//! `node`+`npm` when they satisfy the `dsh` engine range, and otherwise
+//! downloads a pinned Node.js runtime and installs `@deepseek-ai/dsh` from
+//! the configured mirrors (domestic China mirrors by default) into the
+//! app-data runtime directory, and runs the host from there.
+//!
+//! `node`, `npm`, and `dsh` are looked up across [`search_dirs`] — the
+//! inherited `PATH` plus the machine and user `PATH` read from the registry,
+//! plus the well-known install locations. The inherited `PATH` on its own is
+//! a snapshot taken when the *launcher* started, so trusting it alone made
+//! the shell download a runtime on machines that already had Node.js.
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
@@ -45,6 +52,21 @@ const DSH_BIN_REL: &str = "node_modules/@deepseek-ai/dsh/lib/bin.js";
 const DEFAULT_NODE_MIRROR: &str = "https://npmmirror.com/mirrors/node";
 /// Default npm registry mirror.
 const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmmirror.com";
+/// The body a dsh service returns when it is reached without its browser
+/// cookie (`writeUnauthorized` in `@deepseek-ai/dsh-client-connection`). It
+/// names a running dsh this shell cannot attach to, as opposed to a foreign
+/// program holding the port — both must send the host to a free port, but only
+/// this one is worth explaining in the log.
+const AUTH_REQUIRED_MARKER: &str = "dsh web authentication required";
+/// Lifetime of the cookie the shell mints to attach to a running dsh. dsh
+/// signs cookies valid for at most `cookieMaxAgeDays` (30 by default), and
+/// `isAuthenticated` rejects a payload whose lifetime exceeds that cap, so this
+/// stays comfortably under it — the cookie only has to outlive one window.
+const COOKIE_LIFETIME_MILLIS: u64 = 12 * 60 * 60 * 1000;
+/// How much of a loopback response to buffer while classifying a port. dsh's
+/// own page is ~28 KB; the cap only bounds a foreign server that answers
+/// without ever closing.
+const LOOPBACK_READ_LIMIT: usize = 256 * 1024;
 
 /// How long the shell waits for the host's readiness line once it has
 /// spawned. The first-run bootstrap (Node download + dsh install) is not
@@ -82,7 +104,29 @@ struct DesktopState {
     installing: Mutex<bool>,
     npm_progress: Mutex<Option<NpmProgress>>,
     port_retried: Mutex<bool>,
+    /// How many times the host was restarted because it died before it
+    /// published an address — a transient resolution failure on the shared
+    /// profile fallback. Capped by `MAX_RESOLUTION_RETRIES`.
+    resolution_attempts: Mutex<u32>,
 }
+
+/// Restart budget for a host that dies before readiness. The shared profile
+/// fallback is a directory of junction points that security software can hold
+/// for several seconds, so one retry is not always enough to outlive it.
+const MAX_RESOLUTION_RETRIES: u32 = 3;
+
+/// How long each retry waits for the fallback to become readable before
+/// spawning the host again.
+const RESOLUTION_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Backoff applied after the readability wait, for the 1st, 2nd and 3rd
+/// retry. The wait is best-effort (a still-unreadable tree is retried anyway),
+/// so the explicit backoff also covers a release that lands later.
+const RESOLUTION_BACKOFF: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(1500),
+    std::time::Duration::from_millis(4000),
+    std::time::Duration::from_millis(8000),
+];
 
 /// Bytes downloaded so far out of the expected total, while the bootstrap
 /// fetches the Node runtime.
@@ -173,9 +217,52 @@ fn parse_dsh_bin(raw: &str) -> (String, Vec<String>) {
     (program, parts.map(str::to_string).collect())
 }
 
-/// Whether a program with this name resolves on `PATH` (spawns successfully).
+/// Apply the Windows no-console flag to a child command. Even short-lived
+/// version probes can flash a console when launched from a GUI application.
+fn hide_console(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+/// Keep the directory holding the resolved program first on a child's `PATH`.
+/// `dsh` and its plugins shell out to a bare `node`, and lifecycle scripts do
+/// the same, so a child started from an absolute path still needs to *find*
+/// `node` by name.
+fn prepend_program_dir(command: &mut Command, program: &str) {
+    let Some(dir) = Path::new(program)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+    else {
+        return;
+    };
+    let mut search = vec![dir.to_path_buf()];
+    search.extend(std::env::split_paths(&std::env::var("PATH").unwrap_or_default()));
+    if let Ok(joined) = std::env::join_paths(search) {
+        command.env("PATH", joined);
+    }
+}
+
+/// Whether a program with this name can be spawned. The bare name is tried
+/// first (it resolves through the inherited `PATH`), then the absolute path
+/// from [`find_program`], so a launcher that handed the shell a stripped
+/// `PATH` does not turn a present `node` into a missing one.
 fn command_on_path(name: &str) -> bool {
-    Command::new(name)
+    if probe_program(name) {
+        return true;
+    }
+    find_program(name)
+        .map(|path| probe_program(&path.to_string_lossy()))
+        .unwrap_or(false)
+}
+
+/// Spawn a program once to see whether it exists and runs.
+fn probe_program(program: &str) -> bool {
+    let mut command = Command::new(program);
+    hide_console(&mut command);
+    command
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -183,11 +270,185 @@ fn command_on_path(name: &str) -> bool {
         .is_ok()
 }
 
-/// Resolve `name` on `PATH`, probing the `PATHEXT` extensions (`dsh` →
-/// `dsh.exe`, `dsh.cmd`, …). Rust's `Command` does not probe extensions, so
-/// npm's `.cmd` shims are invisible to it. On Windows the bare name is
-/// skipped: npm also drops an extensionless POSIX shim (`dsh`) next to
-/// `dsh.cmd`, and neither it nor a bare `dsh` can be spawned by `Command`.
+/// Resolve a directly spawnable program to its absolute path. Windows only
+/// needs this for `node.exe`: `CreateProcess` cannot run npm's `.cmd` shims,
+/// and `node` is exactly the program the shell later re-spawns as the host,
+/// so an absolute path must survive even when `PATH` did not.
+fn find_program(name: &str) -> Option<PathBuf> {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    for dir in search_dirs() {
+        let path = dir.join(&file);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Append a directory to a search list, skipping blanks and duplicates. The
+/// comparison is case-insensitive on Windows, where `D:\Node` and `d:\node`
+/// are the same directory.
+fn push_search_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if dir.as_os_str().is_empty() {
+        return;
+    }
+    let duplicate = dirs.iter().any(|existing| {
+        if cfg!(windows) {
+            existing
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&dir.to_string_lossy())
+        } else {
+            existing == &dir
+        }
+    });
+    if !duplicate {
+        dirs.push(dir);
+    }
+}
+
+/// Every directory probed for `node`, `npm`, and `dsh`, in priority order:
+/// the inherited `PATH`, then the machine and user `PATH` read straight from
+/// the registry, then the well-known install locations.
+///
+/// The registry pass is what keeps a machine's real toolchain visible. The
+/// inherited `PATH` is a snapshot the launcher took when *it* started —
+/// Explorer hands every child the environment block captured the last time it
+/// read the registry, so a directory added afterwards stays invisible to an
+/// app started from a desktop or Start-menu shortcut until the user signs
+/// out. Probing only the inherited list therefore reported "no Node" on a
+/// machine that has one, and started the 35 MB runtime download instead of
+/// reusing it.
+fn search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for dir in std::env::split_paths(&std::env::var("PATH").unwrap_or_default()) {
+        push_search_dir(&mut dirs, dir);
+    }
+    #[cfg(target_os = "windows")]
+    for dir in registry_search_dirs() {
+        push_search_dir(&mut dirs, dir);
+    }
+    for dir in well_known_dirs() {
+        push_search_dir(&mut dirs, dir);
+    }
+    dirs
+}
+
+/// The machine and user `PATH` as the registry holds them, with
+/// `%NAME%` references resolved.
+#[cfg(target_os = "windows")]
+fn registry_search_dirs() -> Vec<PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    let machine = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(MACHINE_ENV).ok();
+    let user = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment").ok();
+
+    // `Path` is stored as REG_EXPAND_SZ (`%JAVA_HOME%\bin`, `%PNPM_HOME%`, …),
+    // and the registry read returns it unexpanded. Resolve it against the
+    // registry's own variables: the process environment is exactly the
+    // snapshot we are working around and may not define them at all.
+    let lookup = |name: &str| -> Option<String> {
+        if let Ok(value) = std::env::var(name) {
+            return Some(value);
+        }
+        for key in [machine.as_ref(), user.as_ref()].into_iter().flatten() {
+            if let Ok(value) = key.get_value::<String, _>(name) {
+                return Some(value);
+            }
+        }
+        None
+    };
+
+    let mut dirs = Vec::new();
+    for key in [user.as_ref(), machine.as_ref()].into_iter().flatten() {
+        let Ok(raw) = key.get_value::<String, _>("Path") else {
+            continue;
+        };
+        for entry in expand_percent_vars(&raw, &lookup).split(';') {
+            if !entry.trim().is_empty() {
+                dirs.push(PathBuf::from(entry.trim()));
+            }
+        }
+    }
+    dirs
+}
+
+/// Expand `%NAME%` references, leaving undefined names literal — the same
+/// outcome `CreateProcess` produces.
+fn expand_percent_vars(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut expanded = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('%') {
+        expanded.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
+            expanded.push('%');
+            rest = after;
+            continue;
+        };
+        let name = &after[..end];
+        match lookup(&name.to_uppercase()) {
+            Some(replacement) if !name.is_empty() => expanded.push_str(&replacement),
+            _ => {
+                expanded.push('%');
+                expanded.push_str(name);
+                expanded.push('%');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    expanded.push_str(rest);
+    expanded
+}
+
+/// Standard install locations, probed after `PATH` so a custom install always
+/// wins. Covers the official installers, nvm-windows, Volta, and pnpm.
+fn well_known_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let var = |name: &str| std::env::var(name).ok().map(PathBuf::from);
+    if cfg!(windows) {
+        for name in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(root) = var(name) {
+                dirs.push(root.join("nodejs"));
+            }
+        }
+        if let Some(local) = var("LOCALAPPDATA") {
+            dirs.push(local.join("Programs").join("nodejs"));
+            dirs.push(local.join("Volta").join("bin"));
+        }
+        if let Some(roaming) = var("APPDATA") {
+            dirs.push(roaming.join("npm"));
+        }
+        if let Some(pnpm) = var("PNPM_HOME") {
+            dirs.push(PathBuf::from(pnpm));
+        }
+        if let Some(nvm_symlink) = var("NVM_SYMLINK") {
+            dirs.push(PathBuf::from(nvm_symlink));
+        }
+        if let Some(volta) = var("VOLTA_HOME") {
+            dirs.push(PathBuf::from(volta).join("bin"));
+        }
+    } else {
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        if let Some(home) = var("HOME") {
+            dirs.push(home.join(".volta").join("bin"));
+            dirs.push(home.join(".local").join("bin"));
+        }
+    }
+    dirs
+}
+
+/// Resolve `name` across [`search_dirs`], probing the `PATHEXT` extensions
+/// (`dsh` → `dsh.exe`, `dsh.cmd`, …). Rust's `Command` does not probe
+/// extensions, so npm's `.cmd` shims are invisible to it. On Windows the bare
+/// name is skipped: npm also drops an extensionless POSIX shim (`dsh`) next
+/// to `dsh.cmd`, and neither it nor a bare `dsh` can be spawned by `Command`.
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     let candidates: Vec<String> = if cfg!(windows) {
@@ -199,7 +460,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     } else {
         vec![name.to_string()]
     };
-    for dir in std::env::split_paths(&std::env::var("PATH").unwrap_or_default()) {
+    for dir in search_dirs() {
         for candidate in &candidates {
             let path = dir.join(candidate);
             if path.is_file() {
@@ -208,6 +469,164 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Expand `%dp0%` / `%~dp0%` in a shim line against the shim's own directory.
+/// npm writes `dp0` as `%~dp0`, which carries a trailing separator; keeping it
+/// is harmless, and undefined-looking `%NAME%` references are left alone.
+fn expand_shim_dir(text: &str, dir: &Path) -> String {
+    let lower = text.to_ascii_lowercase();
+    let replacement = dir.display().to_string();
+    let mut expanded = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        let rest = &lower[index..];
+        let matched = if rest.starts_with("%~dp0%") {
+            Some(6)
+        } else if rest.starts_with("%dp0%") {
+            Some(5)
+        } else {
+            None
+        };
+        match matched {
+            Some(len) => {
+                expanded.push_str(&replacement);
+                index += len;
+            }
+            None => {
+                let ch = text[index..].chars().next().expect("desktop: shim text is not empty");
+                expanded.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+    expanded
+}
+
+/// The script paths an npm `.cmd`/`.bat` shim launches, read from the shim's
+/// own text with `%dp0%` resolved against the shim's directory.
+///
+/// npm generates every shim from one template whose last line runs
+/// `"%_prog%" "<script>" %*`, where `<script>` is `%dp0%` plus the target's
+/// path *relative to the shim's directory*. That relative path is
+/// layout-dependent:
+///
+/// * a **global** install keeps the shim at the npm prefix root, so it names
+///   `node_modules\@deepseek-ai\dsh\lib\bin.js`;
+/// * a **local** install keeps it in `node_modules\.bin`, so it names
+///   `..\@deepseek-ai\dsh\lib\bin.js`.
+///
+/// Reading the shim instead of guessing one layout is what keeps the shell
+/// coupled to the machine's own installation. Guessing the local layout made
+/// the shell blind to a globally installed `dsh`; it then bootstrapped its own
+/// pinned runtime, and since both installations share `$DSH_HOME`, the
+/// profile's plugin fallback resolved the shell's host out of the *other*
+/// installation's `node_modules` — at a different dsh version, and fatally so
+/// whenever that installation was mid-reinstall.
+fn shim_scripts(shim: &Path) -> Vec<PathBuf> {
+    let Some(dir) = shim.parent() else { return Vec::new() };
+    let Ok(text) = fs::read_to_string(shim) else {
+        // A binary on `PATH` can share the name; only text shims are parsed.
+        return Vec::new();
+    };
+    let mut scripts: Vec<PathBuf> = Vec::new();
+    for token in text.split('"').flat_map(str::split_whitespace) {
+        // The interpreter (`node.exe`) and `%_prog%` are quoted on the same
+        // line; npm's entry point is the only `.js` reference.
+        if !token.to_ascii_lowercase().ends_with(".js") {
+            continue;
+        }
+        let expanded = expand_shim_dir(token, dir);
+        let path = PathBuf::from(&expanded);
+        let path = if path.is_absolute() { path } else { dir.join(path) };
+        if !scripts.contains(&path) {
+            scripts.push(path);
+        }
+    }
+    scripts
+}
+
+/// Resolve an npm-shimmed launcher to a concrete script file: whatever the
+/// shim itself names first, then each `fallbacks` layout in order. Every
+/// fallback entry is a path relative to the shim's own directory.
+fn shim_script(shim: &Path, fallbacks: &[&[&str]]) -> Option<PathBuf> {
+    if let Some(found) = shim_scripts(shim).into_iter().find(|path| path.is_file()) {
+        return Some(found);
+    }
+    let dir = shim.parent()?;
+    fallbacks.iter().find_map(|parts| {
+        let candidate = parts.iter().fold(dir.to_path_buf(), |path, part| path.join(part));
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+/// The `bin.js` of the launcher a host invocation will actually run: the
+/// resolved leading argument, or the `dsh` program followed to its real file
+/// (a `PATH` symlink points into the same `…/@deepseek-ai/dsh/lib/bin.js`).
+/// `None` when neither names that launcher.
+fn launcher_bin_js(program: &str, leading_args: &[String]) -> Option<PathBuf> {
+    let named = leading_args
+        .first()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| fs::canonicalize(program).ok());
+    let named = named?;
+    let tail: Vec<String> = named
+        .components()
+        .rev()
+        .take(4)
+        .map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    // `<scope>/dsh/lib/bin.js`, read backwards.
+    (tail.as_slice() == ["bin.js", "lib", "dsh", "@deepseek-ai"]).then_some(named)
+}
+
+/// The `@deepseek-ai/dsh-web-app` package the launcher resolves, following
+/// Node's parent-directory walk for a bare specifier: every ancestor
+/// directory's `node_modules`. This covers npm's nested layout (the package
+/// under `dsh/node_modules`) and a hoisted one (the package beside `dsh`).
+fn resolved_web_app_dir(bin_js: &Path) -> Option<PathBuf> {
+    // `<install>/node_modules/@deepseek-ai/dsh/lib/bin.js` → `…/@deepseek-ai/dsh`.
+    let package_dir = bin_js.parent()?.parent()?;
+    package_dir.ancestors().find_map(|dir| {
+        let candidate = dir.join("node_modules").join("@deepseek-ai").join("dsh-web-app");
+        candidate.is_dir().then_some(candidate)
+    })
+}
+
+/// Whether the launcher's own `dsh-web-app` accepts `--no-open`.
+///
+/// The flag belongs to that plugin, not to the launcher: the `web` command is
+/// registered when the profile's `dsh-web-app` row boots, and the profile
+/// resolves its plugins out of the *launcher's* installation once its boot has
+/// healed the shared fallback. So the module read here is the one that will
+/// parse the command line — reading the shared fallback instead would answer
+/// for whoever owns it right now, which is exactly wrong in the case that
+/// matters: the bundled `0.1.0-rc.6` has no `--no-open`, so a stale fallback
+/// owned by a newer installation would report support and the flag would then
+/// kill the host. Asking the launcher directly means booting its whole plugin
+/// tree (measured ~8 s).
+///
+/// Anything unreadable answers `false`: `commander` rejects an unknown option
+/// and the host would die before serving anything, while a needless browser
+/// tab is only a nuisance.
+fn web_app_declares_no_open(bin_js: &Path) -> bool {
+    let Some(package_dir) = resolved_web_app_dir(bin_js) else { return false };
+    let Ok(entries) = fs::read_dir(package_dir.join("lib")) else { return false };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("js") {
+            return false;
+        }
+        fs::read_to_string(&path).is_ok_and(|text| text.contains("--no-open"))
+    })
+}
+
+/// Whether the host may be told `--no-open`, i.e. whether the launcher that is
+/// about to run declares the flag.
+fn host_supports_no_open(program: &str, leading_args: &[String]) -> bool {
+    launcher_bin_js(program, leading_args)
+        .is_some_and(|bin_js| web_app_declares_no_open(&bin_js))
 }
 
 /// A `dsh` usable from `PATH`: a directly spawnable program, or an npm-style
@@ -221,8 +640,6 @@ fn resolve_path_dsh() -> Option<(String, Vec<String>)> {
     if !cfg!(windows) {
         return None;
     }
-    // npm's `dsh.cmd` shim lives in `<prefix>/node_modules/.bin` and runs
-    // `node "<dp0>\..\@deepseek-ai\dsh\lib\bin.js"`; follow that pattern.
     let shim = find_on_path("dsh")?;
     log_line(&format!("path dsh shim: {}", shim.display()));
     let extension = shim.extension().and_then(|ext| ext.to_str()).map(str::to_lowercase);
@@ -230,23 +647,32 @@ fn resolve_path_dsh() -> Option<(String, Vec<String>)> {
         log_line(&format!("path dsh shim extension rejected: {extension:?}"));
         return None;
     }
-    let bin_js = shim
-        .parent()?
-        .join("..")
-        .join("@deepseek-ai")
-        .join("dsh")
-        .join("lib")
-        .join("bin.js");
-    let node_available = command_on_path("node");
+    let bin_js = shim_script(
+        &shim,
+        &[
+            // Global install: the shim sits at the npm prefix root.
+            &["node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"],
+            // Local install: `node_modules/.bin` sits one level down.
+            &["..", "@deepseek-ai", "dsh", "lib", "bin.js"],
+        ],
+    );
+    let node = resolve_system_node();
     log_line(&format!(
-        "path dsh bin.js exists: {}, node on path: {}",
-        bin_js.is_file(),
-        node_available,
+        "path dsh bin.js: {}, node found: {}",
+        bin_js
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not found".to_string()),
+        node.as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_string()),
     ));
-    if !bin_js.is_file() || !node_available {
-        return None;
-    }
-    Some(("node".to_string(), vec![bin_js.display().to_string()]))
+    let bin_js = bin_js?;
+    // Hand the host the absolute node path. It is spawned later, and a
+    // relative `node` would be resolved against a `PATH` that either lost the
+    // entry or was never complete to begin with.
+    let node = node?;
+    Some((node.display().to_string(), vec![bin_js.display().to_string()]))
 }
 
 /// The app-owned runtime directory: Node and dsh land here on first run.
@@ -470,12 +896,17 @@ fn node_engine_compliant(version: Option<(u64, u64)>) -> bool {
     }
 }
 
-/// Whether the `node` on `PATH` satisfies the `dsh` engine range.
-fn system_node_compliant() -> bool {
-    if !command_on_path("node") {
-        return false;
-    }
-    let Ok(output) = Command::new("node")
+/// The absolute path of the `node` the shell should use, resolved across
+/// [`search_dirs`] rather than the inherited `PATH` alone.
+fn resolve_system_node() -> Option<PathBuf> {
+    find_program("node")
+}
+
+/// Whether that `node` satisfies the `dsh` engine range.
+fn system_node_compliant(node: &Path) -> bool {
+    let mut command = Command::new(node);
+    hide_console(&mut command);
+    let Ok(output) = command
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -503,26 +934,46 @@ fn resolve_system_npm() -> Option<String> {
     if !matches!(extension.as_deref(), Some("cmd" | "bat")) {
         return None;
     }
-    let npm_cli = shim.parent()?.join("node_modules").join("npm").join("bin").join("npm-cli.js");
-    if !npm_cli.is_file() {
-        return None;
-    }
+    let npm_cli = shim_script(
+        &shim,
+        &[
+            // The official Windows installer keeps npm inside the Node dir.
+            &["node_modules", "npm", "bin", "npm-cli.js"],
+            &["..", "node_modules", "npm", "bin", "npm-cli.js"],
+        ],
+    )?;
     Some(npm_cli.display().to_string())
 }
 
-/// Ensure a usable Node runtime: the system `node`+`npm` when node is on
-/// `PATH` and satisfies the `dsh` engine range, otherwise the pinned mirror
+/// Ensure a usable Node runtime: the system `node`+`npm` when one can be
+/// resolved and satisfies the `dsh` engine range, otherwise the pinned mirror
 /// download inside the runtime dir. Returns the node program and the npm CLI
 /// to run (the system `npm` name or the downloaded npm-cli.js path).
+///
+/// A resolvable system node always wins over the download: it costs the user
+/// nothing, keeps their toolchain authoritative, and works offline.
 fn ensure_node(app: &tauri::AppHandle, runtime: &Path) -> Result<(String, String), String> {
-    if command_on_path("node") && system_node_compliant() {
-        if let Some(npm_cli) = resolve_system_npm() {
-            log_line("using system node/npm (dsh engine compliant)");
-            return Ok(("node".to_string(), npm_cli));
+    if let Some(node) = resolve_system_node() {
+        if system_node_compliant(&node) {
+            if let Some(npm_cli) = resolve_system_npm() {
+                log_line(&format!(
+                    "using system node/npm (dsh engine compliant): {}",
+                    node.display()
+                ));
+                return Ok((node.display().to_string(), npm_cli));
+            }
+            log_line(&format!(
+                "system node {} satisfies the dsh engine range but npm is unusable; downloading the pinned runtime",
+                node.display()
+            ));
+        } else {
+            log_line(&format!(
+                "system node {} does not satisfy the dsh engine range; downloading the pinned runtime",
+                node.display()
+            ));
         }
-    }
-    if command_on_path("node") {
-        log_line("system node present but not dsh-engine compliant or npm unusable; downloading the pinned runtime");
+    } else {
+        log_line("no system node found in the inherited PATH, the registry PATH, or the well-known install locations; downloading the pinned runtime");
     }
     let node_dir = runtime.join("node");
     let (node_exe, npm_cli) = node_runtime_paths(&node_dir);
@@ -607,6 +1058,174 @@ fn package_version(manifest: &Path) -> Option<String> {
     Some(text[value_start..value_end].to_string())
 }
 
+/// Return the user's Harness home, matching `@deepseek-ai/dsh-home-paths`.
+/// `DSH_HOME` wins; otherwise use the native user-profile environment.
+fn dsh_home_dir() -> Option<PathBuf> {
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME")
+    }?;
+    let home = PathBuf::from(home);
+    if let Some(raw) = std::env::var_os("DSH_HOME") {
+        let raw = raw.to_string_lossy();
+        if !raw.trim().is_empty() {
+            let expanded = if raw == "~" {
+                home.clone()
+            } else if raw.starts_with("~/") || raw.starts_with("~\\") {
+                home.join(&raw[2..])
+            } else {
+                PathBuf::from(raw.as_ref())
+            };
+            return Some(if expanded.is_absolute() {
+                expanded
+            } else {
+                std::env::current_dir().ok()?.join(expanded)
+            });
+        }
+    }
+    Some(home.join(".dsh"))
+}
+
+/// Flatten the v1 credentials wrapper (`version: 1` + `refs:`) used by older
+/// dsh releases into the current strict mapping format. This intentionally
+/// accepts only the known legacy shape; unknown documents are left untouched
+/// so a malformed credentials file still produces the host's precise error.
+fn flatten_legacy_credentials(text: &str) -> Option<String> {
+    let mut saw_version = false;
+    let mut saw_refs = false;
+    let mut in_refs = false;
+    let mut entry_indent = None;
+    let mut entries = Vec::new();
+
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !in_refs {
+            if trimmed == "version: 1" {
+                saw_version = true;
+                continue;
+            }
+            if trimmed == "refs:" {
+                saw_refs = true;
+                in_refs = true;
+                continue;
+            }
+            return None;
+        }
+
+        // Legacy refs are an indented mapping. Require every entry to use the
+        // same indentation so nested/multiline YAML is left untouched rather
+        // than being flattened incorrectly.
+        let indent = raw_line.len() - raw_line.trim_start().len();
+        if indent == 0 || raw_line[..indent].contains('\t') {
+            return None;
+        }
+        match entry_indent {
+            Some(expected) if indent != expected => return None,
+            None => entry_indent = Some(indent),
+            _ => {}
+        }
+        let (key, value) = trimmed.split_once(':')?;
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || byte.is_ascii_alphabetic() || byte == b'_'))
+        {
+            return None;
+        }
+        let value = value.trim_start();
+        if value.is_empty() {
+            return None;
+        }
+        entries.push(format!("{key}: {value}"));
+    }
+
+    if !saw_version || !saw_refs {
+        return None;
+    }
+    Some(if entries.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", entries.join("\n"))
+    })
+}
+
+/// Migrate a legacy credentials document before the host's Loader tree reads
+/// it. The original is copied beside the document for recovery, and the
+/// migration is logged without ever logging credential values.
+fn migrate_legacy_credentials_file(path: &Path) -> Result<bool, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("无法读取凭据文件 {}: {error}", path.display())),
+    };
+    let Some(migrated) = flatten_legacy_credentials(&text) else {
+        return Ok(false);
+    };
+
+    let backup = path.with_file_name(format!(
+        "{}.legacy-v1",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or(".credentials.yaml")
+    ));
+    if !backup.exists() {
+        fs::copy(path, &backup).map_err(|error| {
+            format!("无法备份旧凭据文件 {}: {error}", backup.display())
+        })?;
+    }
+    let temp = path.with_file_name(format!(
+        ".{}.migrating-{}",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("credentials.yaml"),
+        std::process::id()
+    ));
+    fs::write(&temp, migrated)
+        .map_err(|error| format!("无法写入迁移中的凭据文件 {}: {error}", temp.display()))?;
+    // `credentials-local` requires owner-only permissions on POSIX. A plain
+    // `fs::write` follows the process umask (often 0644), so tighten the
+    // staging file before it is atomically moved into the live location.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&temp)
+            .map_err(|error| format!("无法检查迁移中的凭据文件 {}: {error}", temp.display()))?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&temp, permissions).map_err(|error| {
+            let _ = fs::remove_file(&temp);
+            format!("无法保护迁移中的凭据文件 {}: {error}", temp.display())
+        })?;
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| {
+            let _ = fs::remove_file(&temp);
+            format!("无法替换旧凭据文件 {}: {error}", path.display())
+        })?;
+    }
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("无法完成凭据文件迁移 {}: {error}", path.display()));
+    }
+    log_line(&format!(
+        "migrated legacy credentials format: {} (backup: {})",
+        path.display(),
+        backup.display()
+    ));
+    Ok(true)
+}
+
+/// Repair known credentials formats before spawning either PATH or bundled dsh.
+fn repair_legacy_credentials() -> Result<(), String> {
+    let Some(home) = dsh_home_dir() else { return Ok(()) };
+    let path = home.join(".credentials.yaml");
+    let _ = migrate_legacy_credentials_file(&path)?;
+    Ok(())
+}
+
 /// Ensure `@deepseek-ai/dsh` is installed in the runtime prefix, via npm from
 /// the configured registry mirror. Returns the launcher's `lib/bin.js` path.
 fn ensure_dsh(
@@ -658,14 +1277,7 @@ fn ensure_dsh(
         .stderr(Stdio::piped());
     // Lifecycle scripts (koffi, node-pty, …) invoke `node` by bare name; make
     // it resolvable even when node is not on the app's PATH.
-    let mut search_paths = std::env::split_paths(&std::env::var("PATH").unwrap_or_default()).collect::<Vec<_>>();
-    if let Some(node_dir) = Path::new(node).parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        if !search_paths.iter().any(|dir| dir == node_dir) {
-            search_paths.insert(0, node_dir.to_path_buf());
-        }
-    }
-    let joined = std::env::join_paths(search_paths).unwrap_or_default();
-    command.env("PATH", joined);
+    prepend_program_dir(&mut command, node);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -789,10 +1401,232 @@ fn ensure_dsh(
     Ok(bin_js.display().to_string())
 }
 
+/// Compare two paths for ownership purposes: separators unified, the NT
+/// `\\?\` prefix stripped, case folded (Windows paths are case-insensitive).
+fn normalized_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\");
+    let text = text.strip_prefix("\\\\?\\").unwrap_or(&text).to_string();
+    text.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+/// Remove a symlink/junction without ever touching its target. A Windows
+/// junction is a reparse-point *directory*, so it needs `remove_dir`; a file
+/// symlink needs `remove_file`.
+fn remove_link(path: &Path) -> std::io::Result<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(directory_error) => fs::remove_file(path).map_err(|_| directory_error),
+    }
+}
+
+/// Whether a fallback link's target belongs to a different installation than
+/// `owned` (already normalised): only absolute targets are judged, because
+/// relative ones are npm `.bin` shims inside a profile's own `node_modules`.
+fn is_foreign_link(target: &Path, owned: &str) -> bool {
+    target.is_absolute() && !normalized_path(target).starts_with(owned)
+}
+
+/// Strip *unserviceable* foreign links out of the shared flat module fallback
+/// `$DSH_HOME/profiles/node_modules`.
+///
+/// dsh resolves every in-box plugin from that directory, not from the
+/// installation's own `node_modules`: `boot()` anchors the Loader at the
+/// profile directory and leaves `bareModuleBaseUrl` unset (only
+/// `profile-boot` calls `boot()`, and the CLI exposes no flag for it), so
+/// Node's parent-directory walk is the only way a bare specifier such as
+/// `@deepseek-ai/dsh-llm` can be found. The fallback is *shared*:
+/// `healProfilesModuleFallback` rebuilds one symlink per package in the
+/// dependency closure of **whichever installation is booting**, and leaves
+/// every other installation's links in place. dsh documents what happens to
+/// those leftovers: "a stale link to a vanished package stays until its name
+/// is reused (dangling links are invisible to resolution)". While the owner
+/// is merely being reinstalled or rebuilt its links dangle for the duration,
+/// and every plugin that resolves through the fallback then fails as
+/// `Cannot find package` — which reads like an incomplete npm install while
+/// not a single dependency is missing.
+///
+/// Only *unserviceable* foreign links are released: a link whose target is
+/// gone, or whose target exists but no longer yields a readable
+/// `package.json` (security software holding the reparse point, or npm
+/// mid-reify having created the directory ahead of its files). A foreign link
+/// that still resolves is left alone: another installation may be using it,
+/// and dsh re-points every name it owns on its next boot anyway. Removing a
+/// link never touches its target. Real directories are left alone too — dsh
+/// refuses to manage over one, so that decision stays with the operator.
+///
+/// Ownership is derived from the running `bin.js`
+/// (`<install>/node_modules/@deepseek-ai/dsh/lib/bin.js`), so this works for
+/// the bundled runtime and for a `PATH`/`DSH_BIN` launcher alike.
+/// @returns how many unserviceable foreign links were removed.
+fn repair_profile_module_fallback(bin_js: &Path) -> usize {
+    let Some(owned) = bin_js.ancestors().nth(4) else { return 0 };
+    if owned.file_name() != Some(std::ffi::OsStr::new("node_modules")) {
+        return 0;
+    }
+    let Some(home) = dsh_home_dir() else { return 0 };
+    let farm = home.join("profiles").join("node_modules");
+    if !farm.is_dir() {
+        return 0;
+    }
+    let owned = normalized_path(owned);
+    let mut removed = 0;
+    let mut links = Vec::new();
+    for entry in fs::read_dir(&farm).into_iter().flatten().flatten() {
+        let path = entry.path();
+        // A `@scope` directory holds the real links; everything else at the
+        // top level is a link itself.
+        if path.is_dir() && !path.is_symlink() && entry.file_name().to_string_lossy().starts_with('@') {
+            for inner in fs::read_dir(&path).into_iter().flatten().flatten() {
+                links.push(inner.path());
+            }
+        } else {
+            links.push(path);
+        }
+    }
+    for link in links {
+        let Ok(target) = fs::read_link(&link) else { continue };
+        if !is_foreign_link(&target, &owned) {
+            continue;
+        }
+        let Some(reason) = unserviceable_reason(&link, &target) else { continue };
+        match remove_link(&link) {
+            Ok(()) => {
+                removed += 1;
+                log_line(&format!(
+                    "profile fallback: released {} ({reason}; target {})",
+                    link.display(),
+                    target.display(),
+                ));
+            }
+            Err(error) => log_line(&format!(
+                "profile fallback: could not release {}: {error}",
+                link.display(),
+            )),
+        }
+    }
+    removed
+}
+
+/// Why a link in the shared fallback cannot serve its package, or `None` when
+/// it still can and must be left alone.
+///
+/// "Dangling" is only the loud half of the failure. A junction whose target
+/// exists but answers nothing — a reparse point security software is holding,
+/// or a directory npm has created ahead of the files it reifies into it —
+/// resolves no package for any installation while looking perfectly healthy to
+/// `exists()`. Read one manifest *through* the link, the same way Node would,
+/// and release it when that fails: the link is worthless to its owner too, and
+/// dsh rebuilds every name it owns on the next boot.
+fn unserviceable_reason(link: &Path, target: &Path) -> Option<&'static str> {
+    if !target.exists() {
+        return Some("its target is gone");
+    }
+    if fs::read(link.join("package.json")).is_err() {
+        return Some("its manifest is unreadable");
+    }
+    None
+}
+
+/// Whether Node would be able to resolve the profile's in-box plugins right
+/// now. The fallback is a directory of links, so "unreadable" is the failure
+/// that matters: security software can hold that tree — junction reparse
+/// points in particular, which is also why deleting one takes the better part
+/// of a second here — long enough for every plugin to look missing, which
+/// surfaces as one `Cannot find package` per entry even though the install is
+/// untouched. Reading one manifest *through* the farm exercises the same link
+/// resolution Node performs, so this is a faithful, read-only probe.
+fn profile_fallback_readable() -> bool {
+    let Some(home) = dsh_home_dir() else { return true };
+    let scope = home.join("profiles").join("node_modules").join("@deepseek-ai");
+    let Ok(entries) = fs::read_dir(&scope) else { return false };
+    // A handful of manifests is enough: a locked tree fails on the first.
+    for (checked, entry) in entries.flatten().enumerate() {
+        if fs::read(entry.path().join("package.json")).is_ok() {
+            return true;
+        }
+        if checked >= 8 {
+            break;
+        }
+    }
+    false
+}
+
+/// Wait for the profile fallback to become readable, polling at a fixed
+/// interval, and report whether it did before the budget elapsed.
+fn wait_for_profile_fallback(budget: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if profile_fallback_readable() {
+            return true;
+        }
+        if started.elapsed() >= budget {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Ask dsh to prepare the selected profile before starting the long-lived
+/// server. The launcher heals `$DSH_HOME/profiles/node_modules` here; doing it
+/// as a separate, hidden process avoids a first-boot race where Loader starts
+/// resolving profile imports before that fallback is visible to Node. That
+/// probe only serialises *our* two processes, so the fallback is also cleared
+/// of links written by a different dsh installation first.
+fn prepare_host_profile(
+    app: &tauri::AppHandle,
+    program: &str,
+    leading_args: &[String],
+) -> Result<(), String> {
+    if let Some(bin_js) = leading_args.first() {
+        let released = repair_profile_module_fallback(Path::new(bin_js));
+        if released > 0 {
+            log_line(&format!(
+                "profile fallback: released {released} unserviceable link(s) left by another dsh installation",
+            ));
+        }
+    }
+    // Recorded so a later failure can be told apart from a locked tree.
+    log_line(&format!(
+        "profile fallback readable before prepare: {}",
+        profile_fallback_readable()
+    ));
+    set_phase(app, "正在准备 dsh Profile 依赖…");
+    let mut command = Command::new(program);
+    hide_console(&mut command);
+    prepend_program_dir(&mut command, program);
+    command
+        .args(leading_args)
+        .arg("web")
+        .arg("--dump-default-config")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = command
+        .output()
+        .map_err(|error| format!("无法准备 dsh Profile：{error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if detail.is_empty() {
+        format!("dsh Profile 准备失败（exit {:?}）。", output.status.code())
+    } else {
+        format!(
+            "dsh Profile 准备失败（exit {:?}）：{}",
+            output.status.code(),
+            detail
+        )
+    })
+}
+
 /// Resolve the host invocation as program plus leading arguments; the `web`
 /// mode argument is appended by the spawner. `DSH_BIN` wins (development),
 /// then a `dsh` on `PATH`, then the first-run bootstrap.
 fn resolve_host_invocation(app: &tauri::AppHandle) -> Result<(String, Vec<String>), String> {
+    // Older dsh releases wrote a wrapped credentials document. Repair it
+    // before any host invocation (including DSH_BIN/PATH overrides) so the
+    // bundled and system launchers observe the same compatible format.
+    set_phase(app, "正在检查本地凭据配置…");
+    repair_legacy_credentials()?;
     if let Ok(raw) = std::env::var("DSH_BIN") {
         return Ok(parse_dsh_bin(&raw));
     }
@@ -852,26 +1686,228 @@ fn looks_like_dsh(response_head: &str) -> bool {
     response_head.contains("__DSH_BOOT__")
 }
 
-/// Whether a dsh web service already answers on the loopback port, meaning
-/// the shell can reuse it instead of spawning a second host (which would die
-/// on EADDRINUSE).
-fn probe_existing_service(port: u16) -> bool {
+/// What already answers on the loopback port the host would bind. The cases
+/// need different reactions, and collapsing them into a boolean is what left
+/// the shell sending a host into a port it could never have.
+#[derive(Debug, PartialEq, Eq)]
+enum PortOwner {
+    /// Nothing is listening: the host may bind the port.
+    Free,
+    /// A dsh service that serves the shell without a token — reuse it, because
+    /// a second host would die on EADDRINUSE.
+    Reusable,
+    /// A dsh service behind its browser-session token. Attaching needs a
+    /// cookie, and a cookie can be minted from the secret both processes share
+    /// through `$DSH_HOME`.
+    Protected,
+    /// Anything else: another program, or a dsh speaking a protocol this shell
+    /// does not know. Spawning here cannot succeed, and dsh says so silently —
+    /// a host that loses the bind prints nothing at all and never becomes
+    /// ready — so the caller must move to a free port instead.
+    Taken,
+}
+
+/// One loopback `GET /`. `Err` means nothing accepted the connection at all,
+/// which is what separates a free port from an occupied one; `Ok` carries the
+/// response read until the peer closes, bounded by [`LOOPBACK_READ_LIMIT`].
+///
+/// The response must be read past its headers: dsh's boot manifest sits at the
+/// end of a ~28 KB document, so a single 4 KiB read lands a few dozen bytes
+/// short and reports a perfectly good dsh service as "not dsh".
+fn loopback_get(port: u16, cookie: Option<&str>) -> Result<String, ()> {
     use std::io::{Read as _, Write as _};
-    let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+    let mut stream = std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         Duration::from_secs(2),
-    ) else {
-        return false;
-    };
+    )
+    .map_err(|_| ())?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).is_err() {
+    // The authority the service signs cookies against is the `Host` header, so
+    // it has to carry the port the browser would send.
+    let cookie = cookie.map(|value| format!("Cookie: {value}\r\n")).unwrap_or_default();
+    let request =
+        format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{cookie}Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).map_err(|_| ())?;
+    let mut response: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            // `Connection: close`: the peer closing is the end of the response.
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&buf[..read]);
+                if response.len() >= LOOPBACK_READ_LIMIT {
+                    break;
+                }
+            }
+            // A read timeout or reset still leaves a usable prefix.
+            Err(_) => break,
+        }
+    }
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Classify the port by connecting and reading the response head.
+fn probe_port(port: u16) -> PortOwner {
+    let Ok(head) = loopback_get(port, None) else {
+        return PortOwner::Free;
+    };
+    if looks_like_dsh(&head) {
+        return PortOwner::Reusable;
+    }
+    if head.contains(AUTH_REQUIRED_MARKER) {
+        return PortOwner::Protected;
+    }
+    PortOwner::Taken
+}
+
+/// base64url without padding, the only encoding dsh's cookie layer writes.
+fn encode_base64_url(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn decode_base64_url(value: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value).ok()
+}
+
+/// The cookie name `cookieName` derives: `dsh-auth-` plus the base64url SHA-256
+/// of the request authority (`127.0.0.1:3080`, port included).
+fn browser_cookie_name(authority: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("dsh-auth-{}", encode_base64_url(&Sha256::digest(authority.as_bytes())))
+}
+
+/// The `v1.<body>.<signature>` value `encodeCookie` produces. The signature
+/// covers the base64url *body string*, not the JSON behind it.
+fn browser_cookie_value(
+    authority: &str,
+    secret: &[u8],
+    issued_at: u64,
+    expires_at: u64,
+) -> String {
+    use hmac::{Hmac, Mac as _};
+    use sha2::Sha256;
+    let body = encode_base64_url(
+        format!(
+            "{{\"version\":1,\"authority\":\"{authority}\",\"issuedAt\":{issued_at},\"expiresAt\":{expires_at}}}"
+        )
+        .as_bytes(),
+    );
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret).expect("desktop: HMAC accepts any key length");
+    mac.update(body.as_bytes());
+    format!("v1.{body}.{}", encode_base64_url(&mac.finalize().into_bytes()))
+}
+
+/// Pull `records["client-connection/browser-session"].payload.secret` out of
+/// the credentials document.
+///
+/// The shell reads one value from a file it does not own, so the block is
+/// walked by indentation rather than by pulling in a YAML parser. Every
+/// failure answers `None`, which degrades to "spawn our own host" — never to a
+/// window stuck on an authentication page.
+fn credentials_record_secret(text: &str) -> Option<Vec<u8>> {
+    const RECORD: &str = "client-connection/browser-session:";
+    let mut record_indent: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match record_indent {
+            None => {
+                if trimmed.starts_with(RECORD) {
+                    record_indent = Some(indent);
+                }
+            }
+            Some(record) => {
+                // The record's block ended without carrying a secret.
+                if indent <= record {
+                    return None;
+                }
+                if let Some(value) = trimmed.strip_prefix("secret:") {
+                    return decode_base64_url(value.trim().trim_matches(['"', '\'']));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The Harness home's browser-session signing secret.
+///
+/// This is what lets a second process authenticate to a `dsh web` the user
+/// started themselves: the launch token in that service's printed URL is
+/// random per process and never persisted, while every cookie it hands out is
+/// signed with this one secret, which `initializeSecret` stores in the
+/// credentials document and every activation of the same home therefore
+/// shares.
+fn browser_session_secret() -> Option<Vec<u8>> {
+    let home = dsh_home_dir()?;
+    let text = fs::read_to_string(home.join(".credentials.yaml")).ok()?;
+    let secret = credentials_record_secret(&text)?;
+    // `canonicalSecret` accepts exactly 32 bytes; anything else is a document
+    // this shell does not understand.
+    (secret.len() == 32).then_some(secret)
+}
+
+/// Whether the service on `port` accepts this cookie.
+fn cookie_authenticates(port: u16, name: &str, value: &str) -> bool {
+    loopback_get(port, Some(&format!("{name}={value}")))
+        .is_ok_and(|head| looks_like_dsh(&head))
+}
+
+/// Attach the window to a running dsh that sits behind its browser-session
+/// token, by minting the cookie that service's own browser holds.
+///
+/// The desktop shell and a `dsh web` the user started are meant to be one
+/// engine over one Harness home. Two engines both list every session, but only
+/// one can hold a session's write handle, so opening a session that is live in
+/// the other one fails with `SessionAlreadyOwnedError` — attaching removes the
+/// second engine instead of explaining the error.
+///
+/// The cookie is proven over HTTP *before* the window navigates, so a rejected
+/// guess leaves an ordinary "spawn a host" startup behind rather than an
+/// authentication page in the desktop window.
+fn attach_browser_session(app: &tauri::AppHandle, port: u16) -> bool {
+    let Some(secret) = browser_session_secret() else {
+        log_line("no browser-session secret is stored; starting a host instead of attaching");
+        return false;
+    };
+    let authority = format!("127.0.0.1:{port}");
+    let name = browser_cookie_name(&authority);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let value = browser_cookie_value(&authority, &secret, now, now + COOKIE_LIFETIME_MILLIS);
+    if !cookie_authenticates(port, &name, &value) {
+        log_line("the minted browser-session cookie was rejected; starting a host instead");
         return false;
     }
-    let mut buf = [0u8; 4096];
-    let read = stream.read(&mut buf).unwrap_or(0);
-    looks_like_dsh(&String::from_utf8_lossy(&buf[..read]))
+    let Some(window) = app.get_webview_window("main") else { return false };
+    // Never logged: the value is a live credential for the running service.
+    let cookie = tauri::webview::Cookie::build((name, value))
+        .domain("127.0.0.1")
+        .path("/")
+        .build();
+    if let Err(error) = window.set_cookie(cookie) {
+        log_line(&format!("could not store the browser-session cookie: {error}"));
+        return false;
+    }
+    set_phase(app, "检测到正在运行的 dsh 服务，正在连接…");
+    log_line(&format!("attached to the running dsh on port {port}"));
+    if let Some(state) = app.try_state::<DesktopState>() {
+        *state.ready.lock().expect("desktop: ready mutex poisoned") = true;
+    }
+    // The attached service is not owned: nothing is registered as the child, so
+    // closing the window leaves it running.
+    open_surface(&window, &format!("http://127.0.0.1:{port}"));
+    true
 }
 
 /// The port `dsh web` will listen on: `--port` from `DSH_DESKTOP_ARGS`, else
@@ -901,22 +1937,39 @@ fn extra_host_args(retry_port: bool) -> Vec<String> {
     args
 }
 
+/// Every argument that follows the `web` mode word. The desktop shell *is* the
+/// surface, so a host able to hand the URL to the system browser is told not
+/// to — otherwise every launch also opens a browser tab beside the window.
+/// The flag only goes to a launcher that declares it: `commander` rejects an
+/// unknown option, and the bundled `0.1.0-rc.6` has no `--no-open` (it never
+/// opens a browser in the first place).
+fn web_mode_args(program: &str, leading_args: &[String], retry_port: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if host_supports_no_open(program, leading_args) {
+        args.push("--no-open".to_string());
+    }
+    args.extend(extra_host_args(retry_port));
+    args
+}
+
 /// Spawn the resolved host invocation (`… web …`), stream its stderr into the
 /// log, and open the surface when the readiness line arrives. With
 /// `retry_port` the host is started on a random port (after an EADDRINUSE).
 fn spawn_and_stream(app: &tauri::AppHandle, program: String, leading_args: Vec<String>, retry_port: bool) {
-    let log_cmd = [program.clone(), leading_args.join(" "), "web".to_string(), extra_host_args(retry_port).join(" ")]
+    let mode_args = web_mode_args(&program, &leading_args, retry_port);
+    let log_cmd = [program.clone(), leading_args.join(" "), "web".to_string(), mode_args.join(" ")]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
     log_line(&format!("host command: {log_cmd}"));
     set_phase(app, "正在启动宿主进程…");
-    let mut command = Command::new(program);
+    let mut command = Command::new(&program);
+    prepend_program_dir(&mut command, &program);
     command
         .args(leading_args)
         .arg("web")
-        .args(extra_host_args(retry_port))
+        .args(mode_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
@@ -1008,7 +2061,59 @@ fn spawn_and_stream(app: &tauri::AppHandle, program: String, leading_args: Vec<S
                     std::thread::spawn(move || {
                         match resolve_host_invocation(&retry_app) {
                             Ok((program, leading_args)) => {
-                                spawn_and_stream(&retry_app, program, leading_args, true);
+                                if let Err(message) =
+                                    prepare_host_profile(&retry_app, &program, &leading_args)
+                                {
+                                    fail_startup(&retry_app, &message);
+                                } else {
+                                    spawn_and_stream(&retry_app, program, leading_args, true);
+                                }
+                            }
+                            Err(message) => fail_startup(&retry_app, &message),
+                        }
+                    });
+                    return;
+                }
+                // A host that dies on the shared profile fallback reports one
+                // `Cannot find package` per plugin entry; a host killed
+                // mid-boot (its fallback held by something else) can report
+                // nothing at all. Both are transient — the usual trigger is
+                // security software holding the junction farm for a few
+                // seconds — so wait for the tree to answer again and retry a
+                // few times before reporting the failure.
+                let attempts = stdout_app.try_state::<DesktopState>()
+                    .map(|state| *state.resolution_attempts.lock().expect("desktop: resolution_attempts mutex poisoned"))
+                    .unwrap_or(MAX_RESOLUTION_RETRIES);
+                let resolution_failed = tail.contains("Cannot find package")
+                    || tail.contains("ERR_MODULE_NOT_FOUND")
+                    || tail.trim().is_empty();
+                if attempts < MAX_RESOLUTION_RETRIES && resolution_failed {
+                    let attempt = attempts + 1;
+                    if let Some(state) = stdout_app.try_state::<DesktopState>() {
+                        *state.resolution_attempts.lock().expect("desktop: resolution_attempts mutex poisoned") = attempt;
+                        *state.stderr_tail.lock().expect("desktop: stderr mutex poisoned") = String::new();
+                    }
+                    set_phase(&stdout_app, &format!(
+                        "依赖解析失败，正在等待文件可访问后重试（第 {attempt}/{MAX_RESOLUTION_RETRIES} 次）…"
+                    ));
+                    log_line(&format!(
+                        "host exited before readiness; waiting for the profile module fallback and retrying (attempt {attempt}/{MAX_RESOLUTION_RETRIES})"
+                    ));
+                    let retry_app = stdout_app.clone();
+                    std::thread::spawn(move || {
+                        if !wait_for_profile_fallback(RESOLUTION_WAIT) {
+                            log_line("profile module fallback still unreadable after waiting; retrying anyway");
+                        }
+                        std::thread::sleep(RESOLUTION_BACKOFF[attempt as usize - 1]);
+                        match resolve_host_invocation(&retry_app) {
+                            Ok((program, leading_args)) => {
+                                if let Err(message) =
+                                    prepare_host_profile(&retry_app, &program, &leading_args)
+                                {
+                                    fail_startup(&retry_app, &message);
+                                } else {
+                                    spawn_and_stream(&retry_app, program, leading_args, true);
+                                }
                             }
                             Err(message) => fail_startup(&retry_app, &message),
                         }
@@ -1037,21 +2142,56 @@ fn spawn_and_stream(app: &tauri::AppHandle, program: String, leading_args: Vec<S
 fn spawn_host(app: &tauri::AppHandle) {
     set_phase(app, "正在启动宿主进程…");
     // Reuse instead of duplicate: a dsh service already answering on the
-    // configured port is the same surface; spawning a second host would die
-    // on EADDRINUSE. The reused service is not owned, so closing the window
-    // must not kill it.
+    // configured port without a token is the same surface, and spawning a
+    // second host would die on EADDRINUSE. The reused service is not owned, so
+    // closing the window must not kill it.
     let port = configured_port();
-    if probe_existing_service(port) {
-        set_phase(app, "检测到正在运行的 dsh 服务，正在连接…");
-        log_line(&format!("reusing existing dsh service on port {port}"));
-        if let Some(state) = app.try_state::<DesktopState>() {
-            *state.ready.lock().expect("desktop: ready mutex poisoned") = true;
+    let retry_port = match probe_port(port) {
+        PortOwner::Reusable => {
+            set_phase(app, "检测到正在运行的 dsh 服务，正在连接…");
+            log_line(&format!("reusing existing dsh service on port {port}"));
+            if let Some(state) = app.try_state::<DesktopState>() {
+                *state.ready.lock().expect("desktop: ready mutex poisoned") = true;
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                open_surface(&window, &format!("http://127.0.0.1:{port}"));
+            }
+            return;
         }
-        if let Some(window) = app.get_webview_window("main") {
-            open_surface(&window, &format!("http://127.0.0.1:{port}"));
+        PortOwner::Free => false,
+        // dsh, but behind its browser-session token. Attaching keeps the
+        // desktop window and the user's own `dsh web` on one engine — and one
+        // engine is what keeps a live session's single write handle out of the
+        // way.
+        PortOwner::Protected => {
+            if attach_browser_session(app, port) {
+                return;
+            }
+            log_line(&format!(
+                "port {port} serves a token-protected dsh that could not be attached to; starting a host on a free port instead"
+            ));
+            set_phase(app, &format!("端口 {port} 已被占用，正在改用空闲端口…"));
+            if let Some(state) = app.try_state::<DesktopState>() {
+                *state.port_retried.lock().expect("desktop: port_retried mutex poisoned") = true;
+            }
+            true
         }
-        return;
-    }
+        // A host sent here is doomed and says nothing about it, so the shell
+        // would sit on an indefinite "waiting for the server" screen until the
+        // readiness timeout. Take a free port up front instead of after a
+        // bind failure — and record the retry, because a host already started
+        // with `--port 0` cannot hit EADDRINUSE.
+        PortOwner::Taken => {
+            log_line(&format!(
+                "port {port} is taken; starting the host on a free port instead"
+            ));
+            set_phase(app, &format!("端口 {port} 已被占用，正在改用空闲端口…"));
+            if let Some(state) = app.try_state::<DesktopState>() {
+                *state.port_retried.lock().expect("desktop: port_retried mutex poisoned") = true;
+            }
+            true
+        }
+    };
     let watchdog_app = app.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -1090,7 +2230,15 @@ fn spawn_host(app: &tauri::AppHandle) {
     let resolve_app = app.clone();
     std::thread::spawn(move || {
         match resolve_host_invocation(&resolve_app) {
-            Ok((program, leading_args)) => spawn_and_stream(&resolve_app, program, leading_args, false),
+            Ok((program, leading_args)) => {
+                if let Err(message) =
+                    prepare_host_profile(&resolve_app, &program, &leading_args)
+                {
+                    fail_startup(&resolve_app, &message);
+                } else {
+                    spawn_and_stream(&resolve_app, program, leading_args, retry_port);
+                }
+            }
             Err(message) => fail_startup(&resolve_app, &message),
         }
     });
@@ -1140,6 +2288,7 @@ pub fn run() {
                 installing: Mutex::new(false),
                 npm_progress: Mutex::new(None),
                 port_retried: Mutex::new(false),
+                resolution_attempts: Mutex::new(0),
             });
             spawn_host(app.handle());
             Ok(())
@@ -1252,7 +2401,7 @@ mod tests {
         let had_node = command_on_path("node");
         let resolved = if cfg!(windows) { resolve_path_dsh() } else { None };
         let system_npm = resolve_system_npm();
-        std::env::set_var("PATH", old_path);
+        std::env::set_var("PATH", &old_path);
         std::env::set_var("PATHEXT", old_pathext);
         fs::remove_dir_all(&root).ok();
         // PATHEXT yields the extension in its own case (dsh.CMD); compare
@@ -1270,11 +2419,23 @@ mod tests {
                 .join("dsh")
                 .join("lib")
                 .join("bin.js");
-            assert_eq!(
-                resolved,
-                Some(("node".to_string(), vec![expected_bin_js.display().to_string()])),
-                "resolve_path_dsh returned {resolved:?} with node_dir {node_dir:?}",
+            let (program, args) = resolved
+                .unwrap_or_else(|| panic!("resolve_path_dsh returned None with node_dir {node_dir:?}"));
+            // The host is spawned later, so the launcher must hand it an
+            // absolute `node`: a bare name would be resolved against a `PATH`
+            // that a stripped launcher could have left without node.
+            assert!(
+                Path::new(&program).is_absolute(),
+                "resolve_path_dsh returned a non-absolute node program: {program}",
             );
+            assert_eq!(
+                Path::new(&program)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_lowercase()),
+                Some(if cfg!(windows) { "node.exe".into() } else { "node".into() }),
+                "resolve_path_dsh returned {program}",
+            );
+            assert_eq!(args, vec![expected_bin_js.display().to_string()]);
             // The npm `.cmd` shim resolves to its npm-cli.js; the bare `npm`
             // name is not spawnable by `Command`.
             assert_eq!(
@@ -1282,6 +2443,117 @@ mod tests {
                 Some(npm_dir.join("npm-cli.js").display().to_string()),
                 "resolve_system_npm returned {system_npm:?}",
             );
+        }
+        // Regression: a *global* npm install puts the shim at the prefix root
+        // and names `%dp0%\node_modules\@deepseek-ai\dsh\lib\bin.js` — no `..`.
+        // Deriving the launcher as `<shim dir>\..\@deepseek-ai\dsh\lib\bin.js`
+        // therefore found nothing on a machine that had dsh installed, so the
+        // shell bootstrapped its own pinned runtime beside it and then shared
+        // `$DSH_HOME` with the installation it had failed to see.
+        if cfg!(windows) && had_node {
+            let prefix = root.join("npm-global");
+            let global_lib = prefix
+                .join("node_modules")
+                .join("@deepseek-ai")
+                .join("dsh")
+                .join("lib");
+            fs::create_dir_all(&global_lib).unwrap();
+            fs::write(global_lib.join("bin.js"), "#!/usr/bin/env node\n").unwrap();
+            fs::write(
+                prefix.join("dsh.cmd"),
+                npm_shim(r"%dp0%\node_modules\@deepseek-ai\dsh\lib\bin.js"),
+            )
+            .unwrap();
+            // Only the global prefix is on the probe PATH, so the local-layout
+            // shim the block above created cannot answer for it.
+            let saved_path = std::env::var_os("PATH").unwrap_or_default();
+            let saved_pathext = std::env::var_os("PATHEXT").unwrap_or_default();
+            let mut test_path = format!("C:\\Windows\\System32;{}", prefix.display());
+            if let Some(dir) = &node_dir {
+                test_path.push(';');
+                test_path.push_str(&dir.display().to_string());
+            }
+            std::env::set_var("PATH", &test_path);
+            std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+            let resolved = if cfg!(windows) { resolve_path_dsh() } else { None };
+            std::env::set_var("PATH", &saved_path);
+            std::env::set_var("PATHEXT", &saved_pathext);
+            let (program, args) = resolved
+                .unwrap_or_else(|| panic!("resolve_path_dsh returned None for a global npm prefix"));
+            assert_eq!(
+                Path::new(&program)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_lowercase()),
+                Some("node.exe".into()),
+                "resolve_path_dsh returned {program}",
+            );
+            assert_eq!(args, vec![global_lib.join("bin.js").display().to_string()]);
+        }
+        // Regression: a shell started from a desktop or Start-menu shortcut
+        // inherits the environment snapshot its launcher captured, so `node`
+        // can be invisible even though the machine has it. The registry and
+        // well-known passes must still resolve it, otherwise the shell
+        // downloads a ~35 MB runtime it does not need. PATH stays mutated
+        // inside this test only, because it is the one test that owns PATH.
+        if cfg!(windows) {
+            std::env::set_var("PATH", r"C:\Windows\System32");
+            let without_inherited_path = resolve_system_node();
+            std::env::set_var("PATH", old_path);
+            if let Some(node) = without_inherited_path {
+                assert!(node.is_absolute(), "resolve_system_node returned {node:?}");
+                // The fallback must land on a real install, never on a stub
+                // that happens to sit in System32.
+                assert!(
+                    !node.to_string_lossy().to_lowercase().contains(r"\system32"),
+                    "resolve_system_node found {node:?} on a stripped PATH",
+                );
+                assert!(
+                    system_node_compliant(&node),
+                    "{node:?} is not dsh-engine compliant",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn percent_variables_expand_against_the_supplied_lookup() {
+        let lookup = |name: &str| match name {
+            "JAVA_HOME" => Some(r"C:\Java".to_string()),
+            "PNPM_HOME" => Some(r"D:\pnpm".to_string()),
+            _ => None,
+        };
+        assert_eq!(expand_percent_vars(r"%JAVA_HOME%\bin", &lookup), r"C:\Java\bin");
+        assert_eq!(
+            expand_percent_vars(r"%PNPM_HOME%;%JAVA_HOME%\bin", &lookup),
+            r"D:\pnpm;C:\Java\bin",
+        );
+        // Undefined variables stay literal, exactly as CreateProcess leaves them.
+        assert_eq!(
+            expand_percent_vars(r"%JAVA_HOME%\bin;%NOT_SET%\x", &lookup),
+            r"C:\Java\bin;%NOT_SET%\x",
+        );
+        // Names are matched case-insensitively; a lone `%` is not a reference.
+        assert_eq!(expand_percent_vars(r"%java_home%", &lookup), r"C:\Java");
+        assert_eq!(expand_percent_vars("100%", &lookup), "100%");
+        assert_eq!(expand_percent_vars("%%", &lookup), "%%");
+    }
+
+    #[test]
+    fn search_dirs_keep_order_and_drop_duplicates() {
+        let mut dirs = Vec::new();
+        push_search_dir(&mut dirs, PathBuf::from(r"C:\first"));
+        push_search_dir(&mut dirs, PathBuf::new());
+        push_search_dir(&mut dirs, PathBuf::from(r"C:\second"));
+        // Same directory in different case: Windows treats them as one.
+        push_search_dir(&mut dirs, PathBuf::from(r"c:\FIRST"));
+        assert_eq!(dirs, vec![PathBuf::from(r"C:\first"), PathBuf::from(r"C:\second")]);
+        // The inherited PATH always comes first, so a user's own install wins
+        // over the well-known locations.
+        let search = search_dirs();
+        let inherited = std::env::split_paths(&std::env::var("PATH").unwrap_or_default())
+            .find(|dir| !dir.as_os_str().is_empty());
+        if let Some(first) = inherited {
+            assert_eq!(search.first(), Some(&first));
         }
     }
 
@@ -1362,6 +2634,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_credentials_are_flattened_and_backed_up() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-credentials-migration-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(".credentials.yaml");
+        fs::write(
+            &path,
+            "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-test\n  OPENAI_API_KEY: 'sk:with-colon'\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            flatten_legacy_credentials(&fs::read_to_string(&path).unwrap()).as_deref(),
+            Some("DEEPSEEK_API_KEY: sk-test\nOPENAI_API_KEY: 'sk:with-colon'\n"),
+        );
+        assert!(migrate_legacy_credentials_file(&path).unwrap());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "DEEPSEEK_API_KEY: sk-test\nOPENAI_API_KEY: 'sk:with-colon'\n",
+        );
+        assert!(path.with_file_name(".credentials.yaml.legacy-v1").is_file());
+        assert!(!migrate_legacy_credentials_file(&path).unwrap());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unknown_credentials_documents_are_not_rewritten() {
+        assert_eq!(
+            flatten_legacy_credentials("version: 2\nrefs:\n  DEEPSEEK_API_KEY: sk-test\n"),
+            None,
+        );
+        assert_eq!(
+            flatten_legacy_credentials("DEEPSEEK_API_KEY: sk-test\n"),
+            None,
+        );
+        assert_eq!(
+            flatten_legacy_credentials("version: 1\nrefs:\n  DEEPSEEK_API_KEY: |\n    sk-test\n"),
+            None,
+        );
+    }
+
+    #[test]
     fn download_reports_monotonic_progress_and_verifies_checksum() {
         use std::io::Write as _;
         use std::net::{Shutdown, TcpListener};
@@ -1419,5 +2735,397 @@ mod tests {
         // The server serves exactly the two connections above; join after
         // both downloads so it cannot block on a connection that never comes.
         server.join().unwrap();
+    }
+
+    #[test]
+    fn normalized_path_folds_case_and_strips_the_nt_prefix() {
+        assert_eq!(
+            normalized_path(Path::new(r"\\?\C:\Users\Linfe\dsh-desktop\runtime")),
+            normalized_path(Path::new(r"c:\users\linfe\dsh-desktop\runtime")),
+        );
+        assert_eq!(
+            normalized_path(Path::new("C:/Users/linfe/.dsh/")),
+            normalized_path(Path::new(r"C:\Users\linfe\.dsh")),
+        );
+    }
+
+    #[test]
+    fn is_foreign_link_only_judges_absolute_targets_outside_the_installation() {
+        let owned = normalized_path(Path::new(r"C:\Users\linfe\dsh-desktop\runtime\dsh\node_modules"));
+        // Owned by the running installation: one unscoped and one scoped link.
+        assert!(!is_foreign_link(
+            Path::new(r"C:\Users\linfe\dsh-desktop\runtime\dsh\node_modules\accepts"),
+            &owned,
+        ));
+        assert!(!is_foreign_link(
+            Path::new(r"C:\Users\linfe\dsh-desktop\runtime\dsh\node_modules\@deepseek-ai\dsh-llm"),
+            &owned,
+        ));
+        // Written by a second installation: must be released.
+        assert!(is_foreign_link(
+            Path::new(r"D:\codetools\npm-global\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-authorization"),
+            &owned,
+        ));
+        // npm's `.bin` shims are relative and belong to a profile, never to
+        // the shared fallback's ownership model.
+        assert!(!is_foreign_link(Path::new(r"..\@deepseek-ai\dsh\lib\bin.js"), &owned));
+    }
+
+    /// npm generates every shim from one template; only the last line's target
+    /// differs per install layout. Both are reproduced verbatim here.
+    fn npm_shim(target: &str) -> String {
+        format!(
+            "@ECHO off\nGOTO start\n:find_dp0\nSET dp0=%~dp0\nEXIT /b\n:start\nSETLOCAL\nCALL :find_dp0\n\nIF EXIST \"%dp0%\\node.exe\" (\n  SET \"_prog=%dp0%\\node.exe\"\n) ELSE (\n  SET \"_prog=node\"\n  SET PATHEXT=%PATHEXT:;.JS;=;%\n)\n\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"{target}\" %*\n"
+        )
+    }
+
+    #[test]
+    fn shim_scripts_read_both_npm_install_layouts() {
+        let root = std::env::temp_dir().join(format!("dsh-shim-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // The local layout keeps a literal `..` in the path, so compare the
+        // files each side actually names.
+        let real = |path: &Path| fs::canonicalize(path).expect("desktop: test path exists");
+
+        // A global install: the shim sits at the npm prefix root.
+        let global = root.join("npm-global");
+        let global_bin = global
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        fs::create_dir_all(global_bin.parent().expect("desktop: bin.js has a parent")).unwrap();
+        fs::write(&global_bin, "#!/usr/bin/env node\n").unwrap();
+        fs::write(
+            global.join("dsh.CMD"),
+            npm_shim(r"%dp0%\node_modules\@deepseek-ai\dsh\lib\bin.js"),
+        )
+        .unwrap();
+        assert_eq!(
+            shim_scripts(&global.join("dsh.CMD")).iter().map(|path| real(path)).collect::<Vec<_>>(),
+            vec![real(&global_bin)],
+        );
+        assert_eq!(
+            shim_script(&global.join("dsh.CMD"), &[]).map(|path| real(&path)),
+            Some(real(&global_bin)),
+        );
+
+        // A local install: `node_modules\.bin` sits one level down.
+        let local = root.join("project");
+        let local_bin = local
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        fs::create_dir_all(local_bin.parent().expect("desktop: bin.js has a parent")).unwrap();
+        fs::create_dir_all(local.join("node_modules").join(".bin")).unwrap();
+        fs::write(&local_bin, "#!/usr/bin/env node\n").unwrap();
+        fs::write(
+            local.join("node_modules").join(".bin").join("dsh.cmd"),
+            npm_shim(r"%dp0%\..\@deepseek-ai\dsh\lib\bin.js"),
+        )
+        .unwrap();
+        assert_eq!(
+            shim_scripts(&local.join("node_modules").join(".bin").join("dsh.cmd"))
+                .iter()
+                .map(|path| real(path))
+                .collect::<Vec<_>>(),
+            vec![real(&local_bin)],
+        );
+
+        // A shim that names nothing still resolves through the static layouts,
+        // which is what a hand-written shim relies on.
+        let hand_written = root.join("handwritten");
+        let hand_lib = hand_written
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib");
+        fs::create_dir_all(&hand_lib).unwrap();
+        fs::write(hand_lib.join("bin.js"), "#!/usr/bin/env node\n").unwrap();
+        fs::create_dir_all(hand_written.join("node_modules").join(".bin")).unwrap();
+        fs::write(
+            hand_written.join("node_modules").join(".bin").join("dsh.cmd"),
+            "@echo off\n",
+        )
+        .unwrap();
+        // A local shim sits one level inside the prefix, hence the `..`.
+        assert_eq!(
+            shim_script(
+                &hand_written.join("node_modules").join(".bin").join("dsh.cmd"),
+                &[&["..", "@deepseek-ai", "dsh", "lib", "bin.js"]],
+            )
+            .map(|path| real(&path)),
+            Some(real(&hand_lib.join("bin.js"))),
+        );
+        // A global shim sits at the prefix root and needs no `..`.
+        fs::write(hand_written.join("dsh.cmd"), "@echo off\n").unwrap();
+        assert_eq!(
+            shim_script(
+                &hand_written.join("dsh.cmd"),
+                &[&["node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"]],
+            )
+            .map(|path| real(&path)),
+            Some(real(&hand_lib.join("bin.js"))),
+        );
+        // Nothing to read: no candidates, no panic.
+        assert!(shim_scripts(&root.join("missing.cmd")).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_open_support_follows_the_launcher_that_will_run() {
+        let root = std::env::temp_dir().join(format!("dsh-no-open-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |path: &Path, text: &str| {
+            fs::create_dir_all(path.parent().expect("desktop: probe file has a parent")).unwrap();
+            fs::write(path, text).unwrap();
+        };
+
+        // npm's nested layout: the web app lives under `dsh/node_modules`.
+        let nested_dsh = root.join("nested").join("node_modules").join("@deepseek-ai").join("dsh");
+        let nested_bin = nested_dsh.join("lib").join("bin.js");
+        write(&nested_bin, "#!/usr/bin/env node\n");
+        let nested_web_app = nested_dsh
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh-web-app");
+        write(
+            &nested_web_app.join("lib").join("startup.js"),
+            ".option(\"--no-open\", \"do not open the Web UI\")\n",
+        );
+        assert_eq!(resolved_web_app_dir(&nested_bin), Some(nested_web_app));
+        assert!(web_app_declares_no_open(&nested_bin));
+
+        // A hoisted layout: the web app sits beside `dsh` instead.
+        let hoisted = root.join("hoisted");
+        let hoisted_bin = hoisted
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        write(&hoisted_bin, "#!/usr/bin/env node\n");
+        let hoisted_web_app = hoisted.join("node_modules").join("@deepseek-ai").join("dsh-web-app");
+        write(
+            &hoisted_web_app.join("lib").join("startup.js"),
+            ".option(\"--host <host>\", \"bind host\")\n",
+        );
+        assert_eq!(resolved_web_app_dir(&hoisted_bin), Some(hoisted_web_app));
+        assert!(
+            !web_app_declares_no_open(&hoisted_bin),
+            "a launcher without --no-open must not be given the flag: commander rejects it",
+        );
+
+        // No web app at all, and a launcher that is not the dsh one: no claim.
+        let bare_bin = root
+            .join("bare")
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        write(&bare_bin, "#!/usr/bin/env node\n");
+        assert_eq!(resolved_web_app_dir(&bare_bin), None);
+        assert!(!web_app_declares_no_open(&bare_bin));
+        let other = root.join("other").join("some-tool.js");
+        write(&other, "#!/usr/bin/env node\n");
+        assert!(!web_app_declares_no_open(&other));
+
+        // The launcher is recognised from its resolved leading argument, which
+        // is what both the `PATH` shim and the bundled runtime hand the shell.
+        assert_eq!(
+            launcher_bin_js("node.exe", &[nested_bin.display().to_string()]),
+            Some(nested_bin.clone()),
+        );
+        assert!(host_supports_no_open("node.exe", &[nested_bin.display().to_string()]));
+        assert!(!host_supports_no_open("node.exe", &[hoisted_bin.display().to_string()]));
+        // A program that is not the launcher, and a launcher that is not the
+        // dsh shape: neither claims support.
+        assert!(!host_supports_no_open("dsh-not-a-real-program-xyz", &[]));
+        assert_eq!(launcher_bin_js(&other.display().to_string(), &[]), None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn port_probe_tells_a_reusable_dsh_from_a_taken_port() {
+        use std::net::TcpListener;
+
+        // Nothing listening: the host may bind it.
+        let free = {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("desktop: bind a probe port");
+            listener.local_addr().expect("desktop: probe addr").port()
+        };
+        assert_eq!(probe_port(free), PortOwner::Free);
+
+        // A dsh that serves the boot manifest: reusable. The marker sits behind
+        // a prelude larger than one naive 4 KiB read, exactly as it does in
+        // dsh's real ~28 KB document — a truncated read reports a healthy
+        // service as "not dsh", which silently costs the reuse.
+        let reusable = TcpListener::bind(("127.0.0.1", 0)).expect("desktop: bind a probe server");
+        let reusable_port = reusable.local_addr().expect("desktop: probe addr").port();
+        let responder = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = reusable.accept() {
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request);
+                let prelude = "x".repeat(8000);
+                let _ = socket.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\r\n<!--{prelude}--><script>window.__DSH_BOOT__={{}}</script>"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        assert_eq!(probe_port(reusable_port), PortOwner::Reusable);
+        responder.join().ok();
+
+        // A token-protected dsh: it is dsh, but the shell holds no cookie for
+        // it, so spawning here would hang forever with no output.
+        let protected = TcpListener::bind(("127.0.0.1", 0)).expect("desktop: bind a probe server");
+        let protected_port = protected.local_addr().expect("desktop: probe addr").port();
+        let responder = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = protected.accept() {
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request);
+                let _ = socket.write_all(
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain; charset=utf-8\r\n\r\n{AUTH_REQUIRED_MARKER}; reopen the URL printed by dsh web.\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        assert_eq!(probe_port(protected_port), PortOwner::Protected);
+        responder.join().ok();
+
+        // A foreign program holding the port: taken as well, for the same
+        // reason — the host cannot bind and would never say so.
+        let foreign = TcpListener::bind(("127.0.0.1", 0)).expect("desktop: bind a probe server");
+        let foreign_port = foreign.local_addr().expect("desktop: probe addr").port();
+        let responder = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = foreign.accept() {
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request);
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nhello\n");
+            }
+        });
+        assert_eq!(probe_port(foreign_port), PortOwner::Taken);
+        responder.join().ok();
+    }
+
+    #[test]
+    fn browser_session_cookie_matches_the_dsh_wire_format() {
+        // Golden values computed from `@deepseek-ai/dsh-client-connection`'s own
+        // `cookieName` / `encodeCookie` (independent Node implementation), for
+        // authority `127.0.0.1:3080`, the 32-byte secret 0x00..0x1f, and a fixed
+        // issue/expiry pair. A drift here means the running service answers 401
+        // and the shell silently falls back to spawning its own host.
+        let authority = "127.0.0.1:3080";
+        let secret: Vec<u8> = (0u8..32).collect();
+        assert_eq!(encode_base64_url(&secret), "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
+        assert_eq!(
+            decode_base64_url("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8").as_deref(),
+            Some(secret.as_slice()),
+        );
+        assert_eq!(
+            browser_cookie_name(authority),
+            "dsh-auth-VPhEEcLKeqRDBoBalzN2Nm7CnfxKhLE00pKIDWxt1sw",
+        );
+        assert_eq!(
+            browser_cookie_value(authority, &secret, 1_700_000_000_000, 1_700_003_600_000),
+            "v1.eyJ2ZXJzaW9uIjoxLCJhdXRob3JpdHkiOiIxMjcuMC4wLjE6MzA4MCIsImlzc3VlZEF0IjoxNzAwMDAwMDAwMDAwLCJleHBpcmVzQXQiOjE3MDAwMDM2MDAwMDB9.B0v5JPOdGQ5Kj6dKuTEbtVltd8tYJxj2llBTMDhV9Sw",
+        );
+        // The default `cookieMaxAgeDays` (30) caps the signed lifetime.
+        assert!(COOKIE_LIFETIME_MILLIS < 30 * 24 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn credentials_record_secret_walks_only_the_browser_session_block() {
+        let document = "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-other\nrecords:\n  client-connection/browser-session:\n    kind: grant\n    payload:\n      version: 1\n      secret: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\n  other/record:\n    secret: QUJD\n";
+        assert_eq!(
+            credentials_record_secret(document).as_deref(),
+            Some((0u8..32).collect::<Vec<u8>>().as_slice()),
+        );
+        // A quoted scalar is still a scalar.
+        let quoted = "records:\n  client-connection/browser-session:\n    payload:\n      secret: \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\"\n";
+        assert_eq!(
+            credentials_record_secret(quoted).as_deref(),
+            Some((0u8..32).collect::<Vec<u8>>().as_slice()),
+        );
+        // No such record, an empty block, and a block that ends before the
+        // secret all answer `None` rather than borrowing another record's.
+        assert_eq!(credentials_record_secret("version: 1\nrefs: {}\n"), None);
+        assert_eq!(
+            credentials_record_secret("records:\n  other/record:\n    secret: QUJD\n"),
+            None,
+        );
+        assert_eq!(
+            credentials_record_secret("records:\n  client-connection/browser-session:\n    kind: grant\n  other/record:\n    secret: QUJD\n"),
+            None,
+        );
+        // Not decodable as base64url: refuse rather than guess.
+        assert_eq!(
+            credentials_record_secret("records:\n  client-connection/browser-session:\n    secret: not*base64\n"),
+            None,
+        );
+    }
+
+    #[test]
+    fn unserviceable_reason_separates_dangling_from_unreadable() {
+        let root = std::env::temp_dir().join(format!("dsh-farm-reason-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        // A directory without a manifest resolves nothing even though it
+        // exists — the case `exists()` alone cannot see.
+        assert_eq!(
+            unserviceable_reason(&target, &target),
+            Some("its manifest is unreadable"),
+        );
+
+        // With the manifest in place, read through the same path Node walks,
+        // the link is healthy and must be left alone for its owner.
+        fs::write(target.join("package.json"), "{}").unwrap();
+        assert_eq!(unserviceable_reason(&target, &target), None);
+
+        // A vanished target is still the loudest reason.
+        assert_eq!(
+            unserviceable_reason(&target, &root.join("gone")),
+            Some("its target is gone"),
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_fallback_readable_needs_a_resolvable_manifest() {
+        let saved = std::env::var_os("DSH_HOME");
+        let root = std::env::temp_dir().join(format!("dsh-farm-probe-{}", std::process::id()));
+        let scope = root.join("profiles").join("node_modules").join("@deepseek-ai");
+        std::env::set_var("DSH_HOME", &root);
+
+        // No fallback at all: there is nothing for Node to resolve.
+        let _ = fs::remove_dir_all(&root);
+        assert!(!profile_fallback_readable());
+
+        // A package directory without a manifest is not resolvable either.
+        fs::create_dir_all(scope.join("dsh-base")).expect("create probe package dir");
+        assert!(!profile_fallback_readable());
+
+        // With the manifest in place the same probe succeeds.
+        fs::write(scope.join("dsh-base").join("package.json"), "{}").expect("write probe manifest");
+        assert!(profile_fallback_readable());
+
+        match saved {
+            Some(value) => std::env::set_var("DSH_HOME", value),
+            None => std::env::remove_var("DSH_HOME"),
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }

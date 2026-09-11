@@ -15,7 +15,9 @@
         <div class="progress-track"><div id="progress-fill"></div></div>
         <span id="progress-pct"></span>
       </div>
-      <p id="hint">首次启动如未检测到 dsh，将自动从国内镜像下载运行时（约 350 MB），请耐心等待。</p>
+      <!-- Shown only while the shell is actually preparing the built-in
+           runtime; splash.js reveals it from the startup phase. -->
+      <p id="hint" hidden>首次启动如未检测到 dsh，将自动从国内镜像下载运行时（约 350 MB），请耐心等待。</p>
       <pre id="detail" hidden></pre>
     </main>
     <script src="splash.js"></script>

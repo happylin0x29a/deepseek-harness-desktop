@@ -7,10 +7,22 @@
 // host's recent stderr, and the shell log path stay on screen.
 const statusEl = document.getElementById('status')
 const detailEl = document.getElementById('detail')
+const hintEl = document.getElementById('hint')
 const spinnerEl = document.getElementById('spinner')
 const progressEl = document.getElementById('progress')
 const progressFill = document.getElementById('progress-fill')
 const progressPct = document.getElementById('progress-pct')
+
+// The runtime-download notice belongs to the bootstrap path only. Left on
+// screen it reads as "a 350 MB download is under way" on every launch,
+// including the ones where an existing dsh was found and nothing is being
+// downloaded at all.
+const BOOTSTRAP_PHASES = [
+  '未检测到 dsh',
+  '正在下载 Node.js',
+  '正在解压 Node.js',
+  '正在安装 dsh',
+]
 
 let installStartedAt = null
 
@@ -48,6 +60,7 @@ async function poll() {
     statusEl.textContent = status.error
     spinnerEl.hidden = true
     progressEl.hidden = true
+    hintEl.hidden = true
     const parts = []
     if (status.stderrTail && status.stderrTail.trim().length > 0) {
       parts.push('宿主输出:\n' + status.stderrTail.trim())
@@ -58,6 +71,7 @@ async function poll() {
     return
   }
   detailEl.hidden = true
+  hintEl.hidden = !BOOTSTRAP_PHASES.some((prefix) => status.phase.startsWith(prefix))
 
   let phase = status.phase
   if (phase.startsWith('正在安装')) {
