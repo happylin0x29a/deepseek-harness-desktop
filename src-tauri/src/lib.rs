@@ -149,6 +149,10 @@ struct EngineUpdateState {
     /// an owned engine can be restarted here — an attached one belongs to
     /// whoever started it.
     owned: bool,
+    /// Bumped when a run starts. The toolbar dismisses a result by remembering
+    /// this number, so hiding the message sticks instead of being undone by the
+    /// next poll — while a *new* run still gets to announce itself.
+    run: u64,
 }
 
 /// Restart budget for a host that dies before readiness. The shared profile
@@ -1809,6 +1813,20 @@ fn encode_base64_url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// The window icon as a data URI, for the drawn title bar.
+///
+/// That bar lives in a page the *engine* serves, so there is no path it could
+/// load the icon from — and approximating the logo with an inline shape is what
+/// made the first attempt look blurry. This is the real bundle icon.
+fn titlebar_logo_data_uri() -> String {
+    use base64::Engine as _;
+    const ICON: &[u8] = include_bytes!("../icons/32x32.png");
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(ICON)
+    )
+}
+
 fn decode_base64_url(value: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value).ok()
@@ -2508,6 +2526,8 @@ struct EngineStatus {
     /// Whether the shell started the engine it is showing. Only then can it
     /// restart it; an attached engine belongs to whoever started it.
     owned: bool,
+    /// Monotonic run counter; a result is dismissed against this number.
+    run: u64,
 }
 
 /// The toolbar's view of the engine: its version, where it lives, and how the
@@ -2533,6 +2553,7 @@ fn engine_status(state: tauri::State<'_, DesktopState>) -> EngineStatus {
         result: update.result,
         failed: update.failed,
         owned,
+        run: update.run,
     }
 }
 
@@ -2833,6 +2854,7 @@ fn engine_update(app: tauri::AppHandle) -> Result<(), String> {
         update.failed = false;
         update.result = None;
         update.npm = None;
+        update.run += 1;
         update.phase = "正在准备更新…".to_string();
     }
     log_line("engine update requested from the toolbar");
@@ -2880,16 +2902,21 @@ fn restart_owned_host(app: &tauri::AppHandle) {
     spawn_host(app);
 }
 
-/// The window chrome and the engine button, drawn into whichever page the
+/// The window chrome and the engine control, drawn into whichever page the
 /// window is showing.
 ///
 /// The window is **undecorated** (`decorations: false`): Windows draws nothing
 /// into a native caption that a webview can host, and neither Tauri nor wry
 /// exposes the WebView2 title-bar overlay, so the only way to put a control at
 /// the window's top-left — beside the app icon — is to draw the whole caption.
-/// This bar is that caption: icon and the engine button on the left, the
-/// minimize / maximize / close buttons on the right, drag on the strip and
-/// double-click to maximize, matching what the native bar did.
+/// This bar is that caption: the app icon and the product name with its engine
+/// version on the left, then the update control, then minimize / maximize /
+/// close on the right, with drag on the strip and double-click to maximize,
+/// matching what the native bar did.
+///
+/// The update control is deliberately **not** a bordered button: it reads as
+/// one more piece of the caption, sitting right after the version, with a caret
+/// to say it opens something and a hover background to say it is clickable.
 ///
 /// It rides on both pages. The splash needs it too, or an undecorated window
 /// could not be moved or closed while it loads. `window.__dshEnginePage`, set
@@ -2921,27 +2948,26 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
     '#dsh-titlebar{position:fixed;top:0;left:0;right:0;height:' + HEIGHT + 'px;display:flex;align-items:center;',
     'z-index:2147483647;user-select:none;background:#1f2430;color:#e8eaf0;border-bottom:1px solid #2c3342;',
     'font:12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;}',
-    '#dsh-titlebar .dsh-logo{width:16px;height:16px;margin:0 8px 0 10px;flex:none;}',
-    '#dsh-titlebar .dsh-caption{opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+    '#dsh-titlebar img.dsh-logo{width:16px;height:16px;margin:0 8px 0 10px;flex:none;display:block;}',
+    '#dsh-titlebar .dsh-caption{opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
     '#dsh-titlebar .dsh-grow{flex:1;min-width:12px;align-self:stretch;}',
-    '#dsh-titlebar button{-webkit-appearance:none;appearance:none;font:inherit;border:0;background:transparent;',
-    'color:inherit;cursor:default;}',
-    '#dsh-engine-btn{display:inline-flex;align-items:center;gap:5px;flex:none;height:22px;margin-right:8px;',
-    'padding:0 9px;border:1px solid rgba(232,234,240,.45) !important;border-radius:6px;cursor:pointer !important;',
-    'opacity:.9;}',
-    '#dsh-engine-btn:hover{background:rgba(255,255,255,.12) !important;opacity:1;}',
-    '#dsh-engine-btn:disabled{opacity:.5;}',
+    '#dsh-titlebar button{-webkit-appearance:none;appearance:none;font:inherit;border:0;background:transparent;color:inherit;}',
+    '#dsh-engine-btn{display:inline-flex;align-items:center;gap:4px;flex:none;height:22px;margin-left:10px;',
+    'padding:0 6px;border-radius:4px;opacity:.85;cursor:pointer;}',
+    '#dsh-engine-btn:hover{background:rgba(255,255,255,.14);opacity:1;}',
+    '#dsh-engine-btn:disabled{opacity:.55;cursor:default;}',
+    '#dsh-engine-btn .dsh-caret{font-size:9px;line-height:1;opacity:.75;}',
     '#dsh-engine-btn .dsh-spin{display:inline-block;width:10px;height:10px;border:2px solid currentColor;',
     'border-top-color:transparent;border-radius:50%;animation:dsh-spin .8s linear infinite;}',
     '@keyframes dsh-spin{to{transform:rotate(360deg)}}',
     '#dsh-titlebar .dsh-sys{width:46px;height:' + HEIGHT + 'px;display:flex;align-items:center;justify-content:center;',
-    'font-family:"Segoe Fluent Icons","Segoe MDL2 Assets",sans-serif;font-size:10px;cursor:default !important;}',
-    '#dsh-titlebar .dsh-sys:hover{background:rgba(255,255,255,.12) !important;}',
-    '#dsh-titlebar .dsh-sys.dsh-close:hover{background:#c42b1c !important;}',
+    'font-family:"Segoe Fluent Icons","Segoe MDL2 Assets",sans-serif;font-size:10px;cursor:default;}',
+    '#dsh-titlebar .dsh-sys:hover{background:rgba(255,255,255,.12);}',
+    '#dsh-titlebar .dsh-sys.dsh-close:hover{background:#c42b1c;}',
     '#dsh-engine-pop{position:fixed;z-index:2147483647;max-width:min(340px,52vw);padding:7px 10px;box-sizing:border-box;',
     'font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#e8eaf0;',
     'background:#1f2430;border:1px solid #2c3342;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.34);',
-    'white-space:pre-wrap;}',
+    'white-space:pre-wrap;cursor:pointer;}',
     '#dsh-engine-pop[hidden]{display:none;}',
     '#dsh-engine-pop .dsh-ok{color:#6ee7a8;}',
     '#dsh-engine-pop .dsh-bad{color:#ff9a9a;}'
@@ -2953,25 +2979,38 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
   const logo = document.createElement('img');
   logo.className = 'dsh-logo';
   logo.alt = '';
-  logo.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#111"/>'
-    + '<path d="M6 19c2.4-4.2 5.6-6.3 9.6-6.3 2.6 0 4.6.9 6.1 2.6l4.3-2.2-1.9 4.4c.3 1.2.4 2.4.3 3.5H6z" fill="#fff"/>'
-    + '<circle cx="12.4" cy="16.2" r="1.3" fill="#111"/></svg>');
-  if (isEnginePage) {
-    const button = document.createElement('button');
-    button.id = 'dsh-engine-btn';
-    button.type = 'button';
-    button.textContent = '更新引擎';
-    bar.append(logo, button);
-  } else {
-    bar.appendChild(logo);
-  }
+  if (typeof window.__dshLogo === 'string') logo.src = window.__dshLogo;
   const caption = document.createElement('span');
   caption.className = 'dsh-caption';
   caption.textContent = 'DeepSeek Harness';
   const grow = document.createElement('span');
   grow.className = 'dsh-grow';
-  bar.append(caption, grow);
+  bar.append(logo, caption);
+
+  const engineItem = isEnginePage ? document.createElement('button') : null;
+  const paintEngineItem = (busy) => {
+    if (engineItem === null) return;
+    engineItem.textContent = '';
+    if (busy) {
+      const spinner = document.createElement('span');
+      spinner.className = 'dsh-spin';
+      engineItem.appendChild(spinner);
+      engineItem.appendChild(document.createTextNode('更新中'));
+      return;
+    }
+    engineItem.appendChild(document.createTextNode('更新引擎'));
+    const caret = document.createElement('span');
+    caret.className = 'dsh-caret';
+    caret.textContent = '\u25BE';
+    engineItem.appendChild(caret);
+  };
+  if (engineItem !== null) {
+    engineItem.id = 'dsh-engine-btn';
+    engineItem.type = 'button';
+    paintEngineItem(false);
+    bar.appendChild(engineItem);
+  }
+  bar.appendChild(grow);
 
   const sysButton = (glyph, label, className) => {
     const element = document.createElement('button');
@@ -2991,7 +3030,6 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
   const pop = document.createElement('div');
   pop.id = 'dsh-engine-pop';
   pop.hidden = true;
-  pop.addEventListener('click', () => { pop.hidden = true; });
   document.body.appendChild(pop);
 
   const placePopup = () => {
@@ -2999,11 +3037,19 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
     pop.style.top = HEIGHT + 6 + 'px';
   };
 
+  // Dismissal is remembered against the run it belongs to, so hiding the
+  // message sticks: the poll keeps reporting the same finished run, and only a
+  // *new* run may announce itself again.
+  let currentRun = 0;
+  let dismissedRun = -1;
+  pop.addEventListener('click', () => {
+    dismissedRun = currentRun;
+    pop.hidden = true;
+  });
+
   minimize.addEventListener('click', () => { invoke('window_minimize').catch(() => {}); });
   close.addEventListener('click', () => { invoke('window_close').catch(() => {}); });
-  maximize.addEventListener('click', () => {
-    invoke('window_toggle_maximize').catch(() => {}).then(() => {});
-  });
+  maximize.addEventListener('click', () => { invoke('window_toggle_maximize').catch(() => {}); });
   bar.addEventListener('mousedown', (event) => {
     if (event.button !== 0 || event.target.closest('button') !== null) return;
     invoke('window_drag').catch(() => {});
@@ -3013,7 +3059,6 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
     invoke('window_toggle_maximize').catch(() => {});
   });
 
-  const engineButton = document.getElementById('dsh-engine-btn');
   const formatSpeed = (bytesPerSecond) => bytesPerSecond >= 1048576
     ? (bytesPerSecond / 1048576).toFixed(1) + ' MB/s'
     : Math.max(0, Math.round(bytesPerSecond / 1024)) + ' KB/s';
@@ -3033,26 +3078,24 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
 
   let announced = false;
   async function poll() {
-    if (!isEnginePage || engineButton === null) return;
+    if (!isEnginePage || engineItem === null) return;
     try {
       const status = await invoke('engine_status');
-      engineButton.disabled = !!status.running;
-      bar.title = (status.version ? 'dsh ' + status.version : 'dsh')
-        + (status.prefix ? '\n安装位置：' + status.prefix : '');
-      engineButton.textContent = '';
+      currentRun = status.run;
+      caption.textContent = status.version
+        ? 'DeepSeek Harness \u00B7 dsh ' + status.version
+        : 'DeepSeek Harness';
+      engineItem.disabled = !!status.running;
+      bar.title = status.prefix ? '安装位置：' + status.prefix : '';
       if (status.running) {
-        const spinner = document.createElement('span');
-        spinner.className = 'dsh-spin';
-        engineButton.appendChild(spinner);
-        engineButton.appendChild(document.createTextNode('更新中'));
+        paintEngineItem(true);
         placePopup();
         pop.className = '';
         pop.textContent = readout(status);
         pop.hidden = false;
       } else {
-        engineButton.appendChild(document.createTextNode('更新引擎'));
-        caption.textContent = status.version ? 'DeepSeek Harness · dsh ' + status.version : 'DeepSeek Harness';
-        if (status.result) {
+        paintEngineItem(false);
+        if (status.result && status.run !== dismissedRun) {
           placePopup();
           pop.className = status.failed ? 'dsh-bad' : 'dsh-ok';
           pop.textContent = status.result + '\n（点击关闭）';
@@ -3073,9 +3116,10 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
   }
 
   let timer = null;
-  if (engineButton !== null) {
-    engineButton.addEventListener('click', async () => {
-      engineButton.disabled = true;
+  if (engineItem !== null) {
+    engineItem.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      engineItem.disabled = true;
       placePopup();
       pop.className = '';
       pop.textContent = '正在启动更新…';
@@ -3083,7 +3127,7 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
       try {
         await invoke('engine_update');
       } catch (error) {
-        engineButton.disabled = false;
+        engineItem.disabled = false;
         pop.className = 'dsh-bad';
         pop.textContent = String(error);
       }
@@ -3192,8 +3236,10 @@ pub fn run() {
                 return;
             }
             let engine_page = is_local_web_url(payload.url().as_str());
-            let script =
-                format!("window.__dshEnginePage = {engine_page};\n{ENGINE_TOOLBAR_SCRIPT}");
+            let script = format!(
+                "window.__dshEnginePage = {engine_page};\nwindow.__dshLogo = '{}';\n{ENGINE_TOOLBAR_SCRIPT}",
+                titlebar_logo_data_uri(),
+            );
             if let Err(error) = webview.eval(script) {
                 log_line(&format!("could not inject the window chrome: {error}"));
             }
