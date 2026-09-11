@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.8"
+version = "0.1.9"
 description = "DeepSeek Harness desktop shell: spawns `dsh web` (bootstrapping the runtime from domestic mirrors on first run) and shows the web surface in a native window"
 edition = "2021"
 license = "MIT"
