@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "engine-surface",
+  "description": "The engine's own page is served by `dsh web` over loopback, so Tauri sees it as a *remote* origin and no capability covers it by default. This one grants exactly the engine toolbar's three commands — the status poll, the update trigger, and the readiness ping — and no core or plugin permission at all.",
+  "windows": ["main"],
+  "local": false,
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": [
+    "allow-engine-status",
+    "allow-engine-update",
+    "allow-toolbar-ready"
+  ]
+}

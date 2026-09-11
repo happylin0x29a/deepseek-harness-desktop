@@ -13,8 +13,12 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon`: the close button hides the shell instead of ending it, so a host
+# this shell spawned keeps serving until the tray's quit item asks for the exit.
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
+# Reading npm's `dist-tags` for the engine update.
+serde_json = "1"
 ureq = "2.12"
 zip = "4"
 tar = "0.4"

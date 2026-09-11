@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, LogicalSize, Manager, Size, Url, WebviewWindow};
 
 /// Ask `CreateProcess` to attach no console window to a child.
@@ -108,6 +110,45 @@ struct DesktopState {
     /// published an address — a transient resolution failure on the shared
     /// profile fallback. Capped by `MAX_RESOLUTION_RETRIES`.
     resolution_attempts: Mutex<u32>,
+    /// Where the engine's own `@deepseek-ai/dsh` package lives, recorded when a
+    /// host is resolved so the toolbar's update rewrites exactly the
+    /// installation the running engine came from.
+    engine_install: Mutex<Option<EngineInstall>>,
+    /// The engine update the toolbar drives: idle, running, or finished.
+    engine_update: Mutex<EngineUpdateState>,
+}
+
+/// The npm prefix owning one `@deepseek-ai/dsh` installation.
+#[derive(Clone)]
+struct EngineInstall {
+    /// `<prefix>` such that `<prefix>/node_modules/@deepseek-ai/dsh` is the
+    /// package. npm rewrites this tree, and its bin shims live here too when
+    /// the install is global.
+    prefix: PathBuf,
+    /// Whether npm must treat `prefix` as a *global* prefix. The bundled
+    /// runtime is a plain local prefix; anything else is the machine's global
+    /// one, whose bin shims sit at the prefix root rather than in
+    /// `node_modules/.bin`.
+    global: bool,
+    bin_js: PathBuf,
+}
+
+/// What the toolbar shows about an engine update.
+#[derive(serde::Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct EngineUpdateState {
+    running: bool,
+    /// Human-readable phase, e.g. `正在下载依赖包…`.
+    phase: String,
+    /// Live npm progress while `running`.
+    npm: Option<NpmProgress>,
+    /// Set once a run ends: what happened, or why it failed.
+    result: Option<String>,
+    failed: bool,
+    /// Whether the engine the shell is showing was started by the shell. Only
+    /// an owned engine can be restarted here — an attached one belongs to
+    /// whoever started it.
+    owned: bool,
 }
 
 /// Restart budget for a host that dies before readiness. The shared profile
@@ -1855,12 +1896,6 @@ fn browser_session_secret() -> Option<Vec<u8>> {
     (secret.len() == 32).then_some(secret)
 }
 
-/// Whether the service on `port` accepts this cookie.
-fn cookie_authenticates(port: u16, name: &str, value: &str) -> bool {
-    loopback_get(port, Some(&format!("{name}={value}")))
-        .is_ok_and(|head| looks_like_dsh(&head))
-}
-
 /// Attach the window to a running dsh that sits behind its browser-session
 /// token, by minting the cookie that service's own browser holds.
 ///
@@ -1885,7 +1920,30 @@ fn attach_browser_session(app: &tauri::AppHandle, port: u16) -> bool {
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0);
     let value = browser_cookie_value(&authority, &secret, now, now + COOKIE_LIFETIME_MILLIS);
-    if !cookie_authenticates(port, &name, &value) {
+    log_line(&format!(
+        "attach diagnostics: authority={authority} cookie={name} secret={} issuedAt={now}",
+        sha256_hex(&secret)
+    ));
+    // Prove the cookie before the window navigates: a rejected guess must leave
+    // an ordinary "spawn a host" startup behind, never an authentication page.
+    let accepted = match loopback_get(port, Some(&format!("{name}={value}"))) {
+        Err(()) => {
+            log_line(&format!("attach probe to port {port}: nothing accepted the connection"));
+            false
+        }
+        Ok(head) => {
+            let accepted = looks_like_dsh(&head);
+            if !accepted {
+                log_line(&format!(
+                    "attach probe to port {port}: {} bytes back, authentication still required = {}",
+                    head.len(),
+                    head.contains(AUTH_REQUIRED_MARKER),
+                ));
+            }
+            accepted
+        }
+    };
+    if !accepted {
         log_line("the minted browser-session cookie was rejected; starting a host instead");
         return false;
     }
@@ -1901,6 +1959,17 @@ fn attach_browser_session(app: &tauri::AppHandle, port: u16) -> bool {
     }
     set_phase(app, "检测到正在运行的 dsh 服务，正在连接…");
     log_line(&format!("attached to the running dsh on port {port}"));
+    // The attached engine's launcher was never resolved — only its port was
+    // found. The `dsh` on `PATH` is what a user starts by hand, so that is the
+    // installation its update targets.
+    if let Some(install) = resolve_path_dsh()
+        .and_then(|(_, leading)| leading.first().map(PathBuf::from))
+        .and_then(|bin_js| engine_install_of(&bin_js))
+    {
+        if let Some(state) = app.try_state::<DesktopState>() {
+            *state.engine_install.lock().expect("desktop: install mutex poisoned") = Some(install);
+        }
+    }
     if let Some(state) = app.try_state::<DesktopState>() {
         *state.ready.lock().expect("desktop: ready mutex poisoned") = true;
     }
@@ -1956,6 +2025,16 @@ fn web_mode_args(program: &str, leading_args: &[String], retry_port: bool) -> Ve
 /// log, and open the surface when the readiness line arrives. With
 /// `retry_port` the host is started on a random port (after an EADDRINUSE).
 fn spawn_and_stream(app: &tauri::AppHandle, program: String, leading_args: Vec<String>, retry_port: bool) {
+    // Record where this engine's `@deepseek-ai/dsh` lives, so the toolbar's
+    // update rewrites the installation actually in use rather than a guess.
+    if let Some(install) = leading_args
+        .first()
+        .and_then(|bin_js| engine_install_of(Path::new(bin_js)))
+    {
+        if let Some(state) = app.try_state::<DesktopState>() {
+            *state.engine_install.lock().expect("desktop: install mutex poisoned") = Some(install);
+        }
+    }
     let mode_args = web_mode_args(&program, &leading_args, retry_port);
     let log_cmd = [program.clone(), leading_args.join(" "), "web".to_string(), mode_args.join(" ")]
         .into_iter()
@@ -2272,6 +2351,668 @@ struct StartupStatus {
 }
 
 /// Build and run the desktop shell.
+/// Compare two `major.minor.patch[-prerelease]` versions the way semver does.
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let split = |value: &str| {
+        let (core, pre) = value.split_once('-').unwrap_or((value, ""));
+        let numbers: Vec<u64> = core.split('.').map(|part| part.parse().unwrap_or(0)).collect();
+        (numbers, pre.to_string())
+    };
+    let (left_numbers, left_pre) = split(left);
+    let (right_numbers, right_pre) = split(right);
+    for index in 0..left_numbers.len().max(right_numbers.len()) {
+        let order = left_numbers
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&right_numbers.get(index).copied().unwrap_or(0));
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    // A prerelease ranks below the release it precedes.
+    match (left_pre.is_empty(), right_pre.is_empty()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => compare_prerelease(&left_pre, &right_pre),
+    }
+}
+
+/// Prerelease ordering: dot-separated identifiers, numeric ones compared
+/// numerically and ranking below alphanumeric ones, and fewer identifiers
+/// losing when every shared one is equal.
+fn compare_prerelease(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let left: Vec<&str> = left.split('.').collect();
+    let right: Vec<&str> = right.split('.').collect();
+    for index in 0..left.len().max(right.len()) {
+        match (left.get(index), right.get(index)) {
+            (Some(a), Some(b)) => {
+                let order = match (a.parse::<u64>(), b.parse::<u64>()) {
+                    (Ok(a), Ok(b)) => a.cmp(&b),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => a.cmp(b),
+                };
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => break,
+        }
+    }
+    Ordering::Equal
+}
+
+/// The newest version dsh publishes to a release channel.
+///
+/// `@latest` is *not* the answer for this package: it is kept at an older RC
+/// than `next` (measured `latest = 0.1.5-rc.1`, `next = 0.1.5-rc.2`), so
+/// installing `@latest` would silently downgrade a current engine. Both
+/// channels are read and the higher wins, with the remaining tags as a
+/// fallback for a package that publishes only one.
+fn newest_engine_version(node: &str, npm_cli: &str) -> Result<String, String> {
+    let mut command = if npm_cli == "npm" {
+        let mut command = Command::new("npm");
+        command.arg("view");
+        command
+    } else {
+        let mut command = Command::new(node);
+        command.arg(npm_cli).arg("view");
+        command
+    };
+    command
+        .arg("@deepseek-ai/dsh")
+        .arg("dist-tags")
+        .arg("--json")
+        .arg("--registry").arg(npm_registry())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console(&mut command);
+    prepend_program_dir(&mut command, node);
+    let output = command
+        .output()
+        .map_err(|error| format!("无法查询最新版本: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "查询最新版本失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let tags: std::collections::BTreeMap<String, String> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("无法解析版本信息: {error}"))?;
+    ["latest", "next"]
+        .iter()
+        .filter_map(|tag| tags.get(*tag))
+        .max_by(|left, right| compare_versions(left, right))
+        .or_else(|| tags.values().max_by(|left, right| compare_versions(left, right)))
+        .cloned()
+        .ok_or_else(|| "镜像没有返回任何版本信息。".to_string())
+}
+
+/// The npm prefix owning `bin_js`, when it has the dsh launcher's shape
+/// (`<prefix>/node_modules/@deepseek-ai/dsh/lib/bin.js`).
+fn engine_install_of(bin_js: &Path) -> Option<EngineInstall> {
+    let modules = bin_js.ancestors().nth(4)?;
+    if modules.file_name() != Some(std::ffi::OsStr::new("node_modules")) {
+        return None;
+    }
+    let prefix = bin_js.ancestors().nth(5)?.to_path_buf();
+    // The bundled runtime is a plain local prefix; anything else is the
+    // machine's global one, whose bin shims live at the prefix root.
+    let global = normalized_path(&prefix) != normalized_path(&runtime_dir().join("dsh"));
+    Some(EngineInstall { prefix, global, bin_js: bin_js.to_path_buf() })
+}
+
+/// The installation the toolbar's update should rewrite: whatever the host was
+/// resolved from, else the `dsh` on `PATH`, else the bundled runtime.
+///
+/// An *attached* service is the one case this cannot know for certain — the
+/// shell never resolved its launcher, only found its port. The `dsh` on `PATH`
+/// is the installation a user starts by hand, so that is the answer here.
+fn current_engine_install(state: &DesktopState) -> Option<EngineInstall> {
+    if let Some(install) = state.engine_install.lock().ok().and_then(|guard| guard.clone()) {
+        return Some(install);
+    }
+    if let Some((_, leading)) = resolve_path_dsh() {
+        if let Some(install) = leading.first().and_then(|bin_js| engine_install_of(Path::new(bin_js))) {
+            return Some(install);
+        }
+    }
+    engine_install_of(&runtime_dir().join("dsh").join(DSH_BIN_REL))
+}
+
+/// The `version` field of the engine's own manifest.
+fn engine_version(install: &EngineInstall) -> String {
+    package_version(&install.prefix.join("node_modules/@deepseek-ai/dsh/package.json"))
+        .unwrap_or_default()
+}
+
+/// What the toolbar polls.
+#[derive(serde::Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct EngineStatus {
+    /// The installed version at the update target, empty when unknown.
+    version: String,
+    /// The prefix npm rewrites, for the toolbar's tooltip.
+    prefix: String,
+    running: bool,
+    phase: String,
+    npm: Option<NpmProgress>,
+    result: Option<String>,
+    failed: bool,
+    /// Whether the shell started the engine it is showing. Only then can it
+    /// restart it; an attached engine belongs to whoever started it.
+    owned: bool,
+}
+
+/// The toolbar's view of the engine: its version, where it lives, and how the
+/// last update run went.
+#[tauri::command]
+fn engine_status(state: tauri::State<'_, DesktopState>) -> EngineStatus {
+    let install = current_engine_install(&state);
+    let update = state
+        .engine_update
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let owned = state.spawned.lock().map(|guard| *guard).unwrap_or(false);
+    EngineStatus {
+        version: install.as_ref().map(engine_version).unwrap_or_default(),
+        prefix: install
+            .as_ref()
+            .map(|install| install.prefix.display().to_string())
+            .unwrap_or_default(),
+        running: update.running,
+        phase: update.phase,
+        npm: update.npm,
+        result: update.result,
+        failed: update.failed,
+        owned,
+    }
+}
+
+/// The toolbar announces itself. The injected script runs inside a page the
+/// *engine* serves, so this log line is the only proof from outside that the
+/// injection happened and that the IPC bridge reached it.
+#[tauri::command]
+fn toolbar_ready(version: String) {
+    log_line(&format!("engine toolbar ready on the engine page (dsh {version})"));
+}
+
+/// Replace a field of the update view, ignoring a poisoned mutex.
+fn set_engine_update(state: &DesktopState, edit: impl FnOnce(&mut EngineUpdateState)) {
+    if let Ok(mut guard) = state.engine_update.lock() {
+        edit(&mut guard);
+    }
+}
+
+/// Install the newest `@deepseek-ai/dsh` into the installation the engine is
+/// running from, reporting npm's progress into the toolbar's state.
+fn perform_engine_update(app: &tauri::AppHandle) -> Result<String, String> {
+    let state = app.state::<DesktopState>();
+    let install = current_engine_install(&state)
+        .ok_or_else(|| "找不到 dsh 的安装位置，无法更新。".to_string())?;
+    let before = engine_version(&install);
+    let node = resolve_system_node().ok_or_else(|| "未找到 node，无法运行 npm 更新。".to_string())?;
+    let node = node.display().to_string();
+    let npm_cli = resolve_system_npm().ok_or_else(|| "未找到可用的 npm，无法更新引擎。".to_string())?;
+
+    set_engine_update(&state, |update| update.phase = "正在检查最新版本…".to_string());
+    let newest = newest_engine_version(&node, &npm_cli)?;
+    if compare_versions(&newest, &before) != std::cmp::Ordering::Greater {
+        // Nothing to do, and nothing to touch: a matching or older channel tag
+        // must never rewrite a working installation.
+        return Ok(format!("已是最新版本（dsh {before}）。"));
+    }
+
+    let cache_dir = runtime_dir().join("npm-cache");
+    let modules_dir = install.prefix.join("node_modules");
+    log_line(&format!(
+        "engine update: npm install{} --prefix {} @deepseek-ai/dsh@{newest} (launcher {}, registry {})",
+        if install.global { " -g" } else { "" },
+        install.prefix.display(),
+        install.bin_js.display(),
+        npm_registry(),
+    ));
+    set_engine_update(&state, |update| update.phase = format!("正在更新到 dsh {newest}…"));
+
+    let mut command = if npm_cli == "npm" {
+        let mut command = Command::new("npm");
+        command.arg("install");
+        command
+    } else {
+        let mut command = Command::new(&node);
+        command.arg(&npm_cli).arg("install");
+        command
+    };
+    if install.global {
+        command.arg("-g");
+    }
+    command
+        .arg("--prefix").arg(&install.prefix)
+        .arg("--cache").arg(&cache_dir)
+        .arg("--registry").arg(npm_registry())
+        .arg("--no-audit").arg("--no-fund")
+        .arg("--no-update-notifier")
+        .arg("--ignore-scripts")
+        .arg("--loglevel").arg("error")
+        .arg(format!("@deepseek-ai/dsh@{newest}"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    prepend_program_dir(&mut command, &node);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().map_err(|error| format!("无法启动 npm: {error}"))?;
+    let stdout = child.stdout.take().expect("desktop: npm stdout is not piped");
+    let stderr = child.stderr.take().expect("desktop: npm stderr is not piped");
+    if let Some(state) = app.try_state::<DesktopState>() {
+        *state.child.lock().expect("desktop: child mutex poisoned") = Some(child);
+    }
+
+    // npm reports no percentage, so the phase is inferred from which signal is
+    // moving — the same readout the first-run installer shows.
+    let monitor_app = app.clone();
+    let monitor_modules = modules_dir.clone();
+    let monitor = std::thread::spawn(move || {
+        let (mut last_bytes, mut last_files) = dir_stats(&cache_dir);
+        let mut last_packages = count_directories(&monitor_modules);
+        let mut last_time = std::time::Instant::now();
+        let mut smoothed = 0u64;
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(state) = monitor_app.try_state::<DesktopState>() else { return };
+            let running = state
+                .engine_update
+                .lock()
+                .map(|guard| guard.running)
+                .unwrap_or(false);
+            if !running {
+                return;
+            }
+            let now = std::time::Instant::now();
+            let (bytes, files) = dir_stats(&cache_dir);
+            let dt = now.duration_since(last_time).as_secs_f64().max(0.001);
+            let instant = ((bytes as f64 - last_bytes as f64) / dt).max(0.0) as u64;
+            smoothed = (smoothed + instant) / 2;
+            let packages = count_directories(&monitor_modules);
+            let phase = if packages < last_packages {
+                "正在校验已安装的文件…"
+            } else if packages > last_packages {
+                "正在解压安装…"
+            } else if bytes.saturating_sub(last_bytes) >= 64 * 1024 {
+                "正在下载依赖包…"
+            } else if files > last_files {
+                "正在获取包元数据…"
+            } else {
+                "正在等待网络响应…"
+            };
+            if let Ok(mut guard) = monitor_app.state::<DesktopState>().engine_update.lock() {
+                guard.phase = phase.to_string();
+                guard.npm = Some(NpmProgress {
+                    phase: phase.to_string(),
+                    bytes,
+                    speed: smoothed,
+                    packages,
+                });
+            }
+            last_bytes = bytes;
+            last_files = files;
+            last_packages = packages;
+            last_time = now;
+        }
+    });
+
+    let out_buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let err_buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let out_reader = out_buf.clone();
+    std::thread::spawn(move || {
+        let mut buf = out_reader.lock().expect("desktop: npm out mutex poisoned");
+        let _ = BufReader::new(stdout).read_to_end(&mut buf);
+    });
+    let err_reader = err_buf.clone();
+    std::thread::spawn(move || {
+        let mut buf = err_reader.lock().expect("desktop: npm err mutex poisoned");
+        let _ = BufReader::new(stderr).read_to_end(&mut buf);
+    });
+
+    let status = match app
+        .try_state::<DesktopState>()
+        .and_then(|state| state.child.lock().ok().and_then(|mut guard| guard.take()))
+    {
+        Some(mut child) => child.wait().map_err(|error| format!("等待 npm 失败: {error}"))?,
+        None => return Err("应用已退出，更新已中止。".to_string()),
+    };
+    set_engine_update(&state, |update| {
+        update.running = false;
+        update.npm = None;
+    });
+    let _ = monitor.join();
+
+    let out = out_buf.lock().expect("desktop: npm out mutex poisoned").clone();
+    let err = err_buf.lock().expect("desktop: npm err mutex poisoned").clone();
+    let mut tail = String::new();
+    for (text, label) in [(&out, "npm out"), (&err, "npm err")] {
+        let text = String::from_utf8_lossy(text);
+        for line in text.lines() {
+            log_line(&format!("engine update {label}: {line}"));
+        }
+        if !text.trim().is_empty() {
+            tail.push_str(&format!("{label}: {}\n", text.trim()));
+        }
+    }
+    if !status.success() {
+        return Err(format!(
+            "更新失败（npm exit {:?}）。{}详情见日志 {}。",
+            status.code(),
+            if tail.is_empty() { String::new() } else { format!("npm 输出:\n{tail}") },
+            log_path(),
+        ));
+    }
+    let after = engine_version(&install);
+    if after == before {
+        return Ok(format!("已是最新版本（dsh {after}）。"));
+    }
+    if after.is_empty() {
+        return Err(format!("npm 退出成功，但 {} 读不到版本。", DSH_BIN_REL));
+    }
+    Ok(format!("引擎已更新：dsh {before} → {after}。"))
+}
+
+/// One update run: install, then restart the engine the shell owns.
+fn run_engine_update(app: tauri::AppHandle) {
+    let outcome = perform_engine_update(&app);
+    let Some(state) = app.try_state::<DesktopState>() else { return };
+    let owned = state.spawned.lock().map(|guard| *guard).unwrap_or(false);
+    match outcome {
+        Ok(message) => {
+            log_line(&format!("engine update finished: {message}"));
+            set_engine_update(&state, |update| {
+                update.failed = false;
+                update.result = Some(if owned {
+                    format!("{message}正在重启引擎…")
+                } else {
+                    format!("{message}引擎由外部进程启动，请重启它以生效。")
+                });
+                update.owned = owned;
+            });
+            if owned {
+                restart_owned_host(&app);
+            }
+        }
+        Err(message) => {
+            log_line(&format!("engine update failed: {message}"));
+            set_engine_update(&state, |update| {
+                update.failed = true;
+                update.result = Some(message);
+                update.owned = owned;
+            });
+        }
+    }
+}
+
+/// Start an engine update in the background. Refuses a second concurrent run.
+#[tauri::command]
+fn engine_update(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<DesktopState>();
+    {
+        let mut update = state
+            .engine_update
+            .lock()
+            .map_err(|_| "引擎更新状态不可用。".to_string())?;
+        if update.running {
+            return Err("更新已经在进行中。".to_string());
+        }
+        update.running = true;
+        update.failed = false;
+        update.result = None;
+        update.npm = None;
+        update.phase = "正在准备更新…".to_string();
+    }
+    log_line("engine update requested from the toolbar");
+    std::thread::spawn(move || run_engine_update(app));
+    Ok(())
+}
+
+/// Restart the host the shell started, so the freshly installed version is what
+/// runs. An attached service is deliberately left alone: it is not the shell's
+/// process to stop, and its owner restarts it.
+fn restart_owned_host(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<DesktopState>() else { return };
+    if !state.spawned.lock().map(|guard| *guard).unwrap_or(false) {
+        return;
+    }
+    if let Ok(mut guard) = state.child.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    if let Ok(mut ready) = state.ready.lock() {
+        *ready = false;
+    }
+    if let Ok(mut spawned) = state.spawned.lock() {
+        *spawned = false;
+    }
+    if let Ok(mut attempts) = state.resolution_attempts.lock() {
+        *attempts = 0;
+    }
+    if let Ok(mut retried) = state.port_retried.lock() {
+        *retried = false;
+    }
+    // Give the port back before respawning, so the fresh host takes the same
+    // one instead of the shell attaching to the corpse it just killed.
+    let port = configured_port();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if matches!(probe_port(port), PortOwner::Free) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    log_line("restarting the engine after the update");
+    spawn_host(app);
+}
+
+/// The engine toolbar the shell injects into the engine's own page.
+///
+/// The desktop window shows a page the *engine* serves, so a shell-owned
+/// control has nowhere to live except inside that document. The bar **pushes
+/// the page down** instead of floating over it: the surface is a
+/// `height: 100%` chain from `body` (`#root{height:100%}`), so shrinking
+/// `body` keeps every panel inside the viewport rather than hiding the app's
+/// own top row behind an overlay.
+///
+/// Every failure inside this script is contained: if the IPC bridge is missing
+/// the bar says so and the engine keeps working, because the shell never
+/// depends on the page it decorates.
+const ENGINE_TOOLBAR_SCRIPT: &str = r##"
+(() => {
+  const invoke = (cmd, args) => {
+    const core = window.__TAURI__ && window.__TAURI__.core;
+    if (core && core.invoke) return core.invoke(cmd, args);
+    const internals = window.__TAURI_INTERNALS__;
+    if (internals && internals.invoke) return internals.invoke(cmd, args);
+    return Promise.reject(new Error('桌面外壳的 IPC 通道不可用'));
+  };
+  if (window.__dshEngineBar) { window.__dshEngineBar.poll(); return; }
+
+  const HEIGHT = 32;
+  const style = document.createElement('style');
+  style.textContent = [
+    'html{height:100%;}',
+    'body{height:calc(100% - ' + HEIGHT + 'px) !important;margin-top:' + HEIGHT + 'px !important;}',
+    '#dsh-engine-bar{position:fixed;top:0;left:0;right:0;height:' + HEIGHT + 'px;display:flex;align-items:center;',
+    'gap:8px;padding:0 10px;box-sizing:border-box;z-index:2147483647;user-select:none;',
+    'font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
+    'background:#1f2430;color:#e8eaf0;border-bottom:1px solid #2c3342;}',
+    '#dsh-engine-bar .dsh-ver{color:#9aa3b5;}',
+    '#dsh-engine-bar .dsh-msg{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:44vw;color:#9aa3b5;}',
+    '#dsh-engine-bar .dsh-msg.ok{color:#6ee7a8;}',
+    '#dsh-engine-bar .dsh-msg.bad{color:#ff9a9a;}',
+    '#dsh-engine-bar .dsh-grow{flex:1;min-width:24px;}',
+    '#dsh-engine-bar .dsh-track{width:140px;height:4px;border-radius:2px;background:#3a4152;overflow:hidden;}',
+    '#dsh-engine-bar .dsh-track[hidden]{display:none;}',
+    '#dsh-engine-bar .dsh-fill{display:block;height:100%;width:35%;background:#4d6bfe;}',
+    '#dsh-engine-bar .dsh-fill.run{animation:dsh-slide 1.1s linear infinite;}',
+    '@keyframes dsh-slide{0%{transform:translateX(-110%);}100%{transform:translateX(320%);}}',
+    '#dsh-engine-bar button{font:inherit;padding:3px 10px;border-radius:5px;border:1px solid #4d6bfe;',
+    'background:#4d6bfe;color:#fff;cursor:pointer;}',
+    '#dsh-engine-bar button:disabled{opacity:.55;cursor:default;}'
+  ].join('');
+  document.documentElement.appendChild(style);
+
+  const bar = document.createElement('div');
+  bar.id = 'dsh-engine-bar';
+  const ver = document.createElement('span');
+  ver.className = 'dsh-ver';
+  const msg = document.createElement('span');
+  msg.className = 'dsh-msg';
+  const grow = document.createElement('span');
+  grow.className = 'dsh-grow';
+  const track = document.createElement('span');
+  track.className = 'dsh-track';
+  track.hidden = true;
+  const fill = document.createElement('span');
+  fill.className = 'dsh-fill';
+  track.appendChild(fill);
+  const button = document.createElement('button');
+  button.textContent = '更新引擎';
+  bar.append(ver, msg, grow, track, button);
+  document.body.appendChild(bar);
+
+  const formatSpeed = (bytesPerSecond) => bytesPerSecond >= 1048576
+    ? (bytesPerSecond / 1048576).toFixed(1) + ' MB/s'
+    : Math.max(0, Math.round(bytesPerSecond / 1024)) + ' KB/s';
+
+  const readout = (status) => {
+    const parts = [status.phase];
+    const npm = status.npm;
+    if (npm) {
+      if (npm.phase.indexOf('下载依赖包') >= 0) {
+        parts.push('已下载 ' + Math.round(npm.bytes / 1048576) + ' MB');
+        parts.push('网速 ' + formatSpeed(npm.speed));
+      }
+      if (npm.phase.indexOf('解压安装') >= 0) parts.push('已安装 ' + npm.packages + ' 个包');
+    }
+    return parts.join(' · ');
+  };
+
+  let announced = false;
+  async function poll() {
+    try {
+      const status = await invoke('engine_status');
+      ver.textContent = status.version ? 'dsh ' + status.version : 'dsh —';
+      bar.title = status.prefix ? '安装位置：' + status.prefix : '';
+      button.disabled = !!status.running;
+      button.textContent = status.running ? '更新中…' : '更新引擎';
+      track.hidden = !status.running;
+      fill.className = status.running ? 'dsh-fill run' : 'dsh-fill';
+      if (status.running) {
+        msg.className = 'dsh-msg';
+        msg.textContent = readout(status);
+      } else if (status.result) {
+        msg.className = status.failed ? 'dsh-msg bad' : 'dsh-msg ok';
+        msg.textContent = status.result;
+      } else {
+        msg.className = 'dsh-msg';
+        msg.textContent = status.owned ? '' : '引擎由外部进程启动';
+      }
+      if (!announced) {
+        announced = true;
+        invoke('toolbar_ready', { version: status.version || 'unknown' }).catch(() => {});
+      }
+    } catch (error) {
+      msg.className = 'dsh-msg bad';
+      msg.textContent = '无法读取引擎状态：' + String(error);
+    }
+    timer = setTimeout(poll, 1200);
+  }
+
+  let timer = null;
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    msg.className = 'dsh-msg';
+    msg.textContent = '正在启动更新…';
+    try {
+      await invoke('engine_update');
+    } catch (error) {
+      button.disabled = false;
+      msg.className = 'dsh-msg bad';
+      msg.textContent = String(error);
+    }
+  });
+
+  window.__dshEngineBar = { poll: () => { if (timer !== null) clearTimeout(timer); poll(); } };
+  poll();
+})();
+"##;
+
+/// Tray menu ids.
+const TRAY_SHOW: &str = "tray-show";
+const TRAY_QUIT: &str = "tray-quit";
+
+/// Bring the shell's window back from the tray.
+fn show_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else { return };
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
+/// Give the shell a tray icon, so hiding the window does not hide the process.
+///
+/// The window is the *surface*, not the application. Once the shell has spawned
+/// a host, ending the process ends the engine serving the window — and if the
+/// user is mid-conversation in a browser tab on that engine, that tab dies with
+/// it. So the close button only hides the shell; the engine keeps running
+/// behind the tray, and the tray's quit item is the single deliberate exit —
+/// the path where [`tauri::RunEvent::Exit`] hands the owned host to its kill.
+///
+/// A service the shell only *attached to* is not owned and is left running
+/// either way, which is why quitting from the tray is safe there too.
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, TRAY_SHOW, "显示窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, TRAY_QUIT, "退出（同时关闭引擎）", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("main")
+        .tooltip("DeepSeek Harness")
+        .menu(&menu)
+        // Windows convention: left click returns to the window, right click
+        // opens the menu that holds the quit item.
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            TRAY_SHOW => show_main_window(app),
+            TRAY_QUIT => {
+                log_line("tray: quit requested; stopping the owned host");
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
@@ -2289,15 +3030,64 @@ pub fn run() {
                 npm_progress: Mutex::new(None),
                 port_retried: Mutex::new(false),
                 resolution_attempts: Mutex::new(0),
+                engine_install: Mutex::new(None),
+                engine_update: Mutex::new(EngineUpdateState::default()),
             });
             spawn_host(app.handle());
+            if let Err(error) = build_tray(app) {
+                // Without a tray there is no way back from a hidden window, so
+                // say so loudly and keep the close button meaning "exit".
+                log_line(&format!("tray unavailable ({error}); the close button will end the shell"));
+            }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![startup_status])
+        // Decorate the engine's own page with the toolbar on every load, the
+        // splash page excepted: the shell's loading UI is already its own.
+        // The page is a *remote* origin to Tauri, so `capabilities/
+        // engine-surface.json` is what lets its IPC through.
+        .on_page_load(|webview, payload| {
+            if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                return;
+            }
+            let url = payload.url().as_str();
+            if !is_local_web_url(url) {
+                return;
+            }
+            if let Err(error) = webview.eval(ENGINE_TOOLBAR_SCRIPT) {
+                log_line(&format!("could not inject the engine toolbar: {error}"));
+            }
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // The window is the surface, not the application: hiding keeps
+                // a host this shell spawned — and any browser tab pointed at
+                // it — alive. Ending the process is the tray's quit item.
+                api.prevent_close();
+                let _ = window.hide();
+                log_line("window closed to the tray; the shell is still running");
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            startup_status,
+            engine_status,
+            engine_update,
+            toolbar_ready
+        ])
         .build(tauri::generate_context!())
         .expect("error while building the desktop shell");
-    app.run(|handle, event| {
-        if let tauri::RunEvent::Exit = event {
+    app.run(|handle, event| match event {
+        // Hiding the window can leave the platform thinking every window is
+        // gone, which asks for an exit with no code. That is not the user
+        // quitting — keep serving from the tray. Only a programmatic exit
+        // (the tray item) carries a code, and that one is allowed through. A
+        // shell whose window no longer exists has nothing left to show, so it
+        // is allowed through as well rather than lingering as a zombie.
+        tauri::RunEvent::ExitRequested { api, code, .. } => {
+            if code.is_none() && handle.get_webview_window("main").is_some() {
+                api.prevent_exit();
+            }
+        }
+        tauri::RunEvent::Exit => {
             // An exit that skips managed-state drop (a force-killed window)
             // must not orphan the host server behind it. Drop on DesktopState
             // remains the ordinary path; this is the explicit fallback.
@@ -2310,6 +3100,7 @@ pub fn run() {
                 }
             }
         }
+        _ => {}
     })
 }
 
@@ -3073,6 +3864,50 @@ mod tests {
             credentials_record_secret("records:\n  client-connection/browser-session:\n    secret: not*base64\n"),
             None,
         );
+    }
+
+    #[test]
+    fn version_comparison_never_mistakes_a_downgrade_for_an_update() {
+        use std::cmp::Ordering;
+        // The measured channel state: `latest` trails `next`, so `@latest`
+        // would look "newer" to npm while actually moving backwards.
+        assert_eq!(compare_versions("0.1.5-rc.2", "0.1.5-rc.1"), Ordering::Greater);
+        assert_eq!(compare_versions("0.1.5-rc.1", "0.1.5-rc.2"), Ordering::Less);
+        assert_eq!(compare_versions("0.1.5-rc.2", "0.1.5-rc.2"), Ordering::Equal);
+        // A release outranks the prereleases it precedes.
+        assert_eq!(compare_versions("0.1.5", "0.1.5-rc.2"), Ordering::Greater);
+        assert_eq!(compare_versions("0.1.5-rc.2", "0.1.5"), Ordering::Less);
+        // Numeric identifiers compare numerically, not lexically.
+        assert_eq!(compare_versions("0.1.5-rc.10", "0.1.5-rc.9"), Ordering::Greater);
+        assert_eq!(compare_versions("0.1.10", "0.1.9"), Ordering::Greater);
+        // Alphanumeric identifiers rank above numeric ones.
+        assert_eq!(compare_versions("0.2.0-alpha", "0.2.0-1"), Ordering::Greater);
+        // Fewer identifiers lose when every shared one is equal.
+        assert_eq!(compare_versions("0.2.0-rc", "0.2.0-rc.1"), Ordering::Less);
+        // Missing components read as zero, and an unparsable core is not fatal.
+        assert_eq!(compare_versions("0.2", "0.2.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.0", "0.9.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn engine_install_reads_the_prefix_out_of_the_launcher_path() {
+        let bundled_bin = runtime_dir().join("dsh").join(DSH_BIN_REL);
+        match engine_install_of(&bundled_bin) {
+            Some(install) => {
+                assert!(
+                    !install.global,
+                    "the bundled runtime is a local prefix, not a global one",
+                );
+                assert_eq!(install.prefix, runtime_dir().join("dsh"));
+            }
+            None => panic!("the bundled launcher path must resolve to an install"),
+        }
+        let global_bin = Path::new(r"D:\npm-global\node_modules\@deepseek-ai\dsh\lib\bin.js");
+        let install = engine_install_of(global_bin).expect("a global launcher resolves");
+        assert!(install.global, "anything outside the runtime dir is a global prefix");
+        assert_eq!(install.prefix, Path::new(r"D:\npm-global"));
+        // Not the launcher's shape: refuse rather than guess a prefix.
+        assert!(engine_install_of(Path::new(r"D:\x\lib\other.js")).is_none());
     }
 
     #[test]
