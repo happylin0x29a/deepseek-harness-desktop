@@ -2585,9 +2585,19 @@ fn set_engine_update(state: &DesktopState, edit: impl FnOnce(&mut EngineUpdateSt
     }
 }
 
+/// What one update run did. The difference matters twice over: an unchanged
+/// installation must not bounce a running engine, and it must not tell the user
+/// to restart one either.
+enum UpdateOutcome {
+    /// The newest published version was already installed; nothing was written.
+    Current(String),
+    /// npm replaced the installation with a newer version.
+    Updated(String),
+}
+
 /// Install the newest `@deepseek-ai/dsh` into the installation the engine is
 /// running from, reporting npm's progress into the toolbar's state.
-fn perform_engine_update(app: &tauri::AppHandle) -> Result<String, String> {
+fn perform_engine_update(app: &tauri::AppHandle) -> Result<UpdateOutcome, String> {
     let state = app.state::<DesktopState>();
     let install = current_engine_install(&state)
         .ok_or_else(|| "找不到 dsh 的安装位置，无法更新。".to_string())?;
@@ -2601,7 +2611,7 @@ fn perform_engine_update(app: &tauri::AppHandle) -> Result<String, String> {
     if compare_versions(&newest, &before) != std::cmp::Ordering::Greater {
         // Nothing to do, and nothing to touch: a matching or older channel tag
         // must never rewrite a working installation.
-        return Ok(format!("已是最新版本（dsh {before}）。"));
+        return Ok(UpdateOutcome::Current(format!("已是最新版本（dsh {before}）。")));
     }
 
     let cache_dir = runtime_dir().join("npm-cache");
@@ -2724,10 +2734,6 @@ fn perform_engine_update(app: &tauri::AppHandle) -> Result<String, String> {
         Some(mut child) => child.wait().map_err(|error| format!("等待 npm 失败: {error}"))?,
         None => return Err("应用已退出，更新已中止。".to_string()),
     };
-    set_engine_update(&state, |update| {
-        update.running = false;
-        update.npm = None;
-    });
     let _ = monitor.join();
 
     let out = out_buf.lock().expect("desktop: npm out mutex poisoned").clone();
@@ -2752,12 +2758,13 @@ fn perform_engine_update(app: &tauri::AppHandle) -> Result<String, String> {
     }
     let after = engine_version(&install);
     if after == before {
-        return Ok(format!("已是最新版本（dsh {after}）。"));
+        // npm ran but the installation already carried this version.
+        return Ok(UpdateOutcome::Current(format!("已是最新版本（dsh {after}）。")));
     }
     if after.is_empty() {
         return Err(format!("npm 退出成功，但 {} 读不到版本。", DSH_BIN_REL));
     }
-    Ok(format!("引擎已更新：dsh {before} → {after}。"))
+    Ok(UpdateOutcome::Updated(format!("引擎已更新：dsh {before} → {after}。")))
 }
 
 /// One update run: install, then restart the engine the shell owns.
@@ -2765,8 +2772,26 @@ fn run_engine_update(app: tauri::AppHandle) {
     let outcome = perform_engine_update(&app);
     let Some(state) = app.try_state::<DesktopState>() else { return };
     let owned = state.spawned.lock().map(|guard| *guard).unwrap_or(false);
+    // Completion is owned *here*, not by the install path: an "already current"
+    // run returns before npm ever starts, so clearing `running` only on the npm
+    // path left the toolbar rendering its last phase and the button disabled
+    // forever. Whatever the outcome, this is the one place that ends the run.
+    set_engine_update(&state, |update| {
+        update.running = false;
+        update.npm = None;
+    });
     match outcome {
-        Ok(message) => {
+        // Nothing was written, so there is nothing to restart and nothing to
+        // tell the user to restart.
+        Ok(UpdateOutcome::Current(message)) => {
+            log_line(&format!("engine update finished: {message}"));
+            set_engine_update(&state, |update| {
+                update.failed = false;
+                update.result = Some(message);
+                update.owned = owned;
+            });
+        }
+        Ok(UpdateOutcome::Updated(message)) => {
             log_line(&format!("engine update finished: {message}"));
             set_engine_update(&state, |update| {
                 update.failed = false;
