@@ -2821,17 +2821,23 @@ fn restart_owned_host(app: &tauri::AppHandle) {
     spawn_host(app);
 }
 
-/// The engine toolbar the shell injects into the engine's own page.
+/// The engine button the shell injects into the engine's own page.
 ///
 /// The desktop window shows a page the *engine* serves, so a shell-owned
-/// control has nowhere to live except inside that document. The bar **pushes
-/// the page down** instead of floating over it: the surface is a
-/// `height: 100%` chain from `body` (`#root{height:100%}`), so shrinking
-/// `body` keeps every panel inside the viewport rather than hiding the app's
-/// own top row behind an overlay.
+/// control has nowhere to live except inside that document. It goes into the
+/// sidebar's brand row — `[class*="logoRow"]`, the strip holding the logo and
+/// the collapse toggle — because that is the window's top-left corner and the
+/// row is already a flex container with a gap, so an extra child simply flows
+/// in. Nothing is overlaid on the app's own layout and nothing is pushed
+/// around.
+///
+/// React owns that row, so a re-render can drop the button; the poll below
+/// re-attaches it whenever it goes missing. The status popover is positioned
+/// from the row's own rectangle rather than inserted into it, so it never
+/// disturbs the layout it reports on.
 ///
 /// Every failure inside this script is contained: if the IPC bridge is missing
-/// the bar says so and the engine keeps working, because the shell never
+/// the popover says so and the engine keeps working, because the shell never
 /// depends on the page it decorates.
 const ENGINE_TOOLBAR_SCRIPT: &str = r##"
 (() => {
@@ -2844,49 +2850,47 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
   };
   if (window.__dshEngineBar) { window.__dshEngineBar.poll(); return; }
 
-  const HEIGHT = 32;
   const style = document.createElement('style');
   style.textContent = [
-    'html{height:100%;}',
-    'body{height:calc(100% - ' + HEIGHT + 'px) !important;margin-top:' + HEIGHT + 'px !important;}',
-    '#dsh-engine-bar{position:fixed;top:0;left:0;right:0;height:' + HEIGHT + 'px;display:flex;align-items:center;',
-    'gap:8px;padding:0 10px;box-sizing:border-box;z-index:2147483647;user-select:none;',
-    'font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
-    'background:#1f2430;color:#e8eaf0;border-bottom:1px solid #2c3342;}',
-    '#dsh-engine-bar .dsh-ver{color:#9aa3b5;}',
-    '#dsh-engine-bar .dsh-msg{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:44vw;color:#9aa3b5;}',
-    '#dsh-engine-bar .dsh-msg.ok{color:#6ee7a8;}',
-    '#dsh-engine-bar .dsh-msg.bad{color:#ff9a9a;}',
-    '#dsh-engine-bar .dsh-grow{flex:1;min-width:24px;}',
-    '#dsh-engine-bar .dsh-track{width:140px;height:4px;border-radius:2px;background:#3a4152;overflow:hidden;}',
-    '#dsh-engine-bar .dsh-track[hidden]{display:none;}',
-    '#dsh-engine-bar .dsh-fill{display:block;height:100%;width:35%;background:#4d6bfe;}',
-    '#dsh-engine-bar .dsh-fill.run{animation:dsh-slide 1.1s linear infinite;}',
-    '@keyframes dsh-slide{0%{transform:translateX(-110%);}100%{transform:translateX(320%);}}',
-    '#dsh-engine-bar button{font:inherit;padding:3px 10px;border-radius:5px;border:1px solid #4d6bfe;',
-    'background:#4d6bfe;color:#fff;cursor:pointer;}',
-    '#dsh-engine-bar button:disabled{opacity:.55;cursor:default;}'
+    '#dsh-engine-btn{display:inline-flex;align-items:center;gap:5px;flex:none;height:24px;padding:0 8px;',
+    'box-sizing:border-box;font:12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
+    'color:inherit;opacity:.72;background:transparent;border:1px solid currentColor;border-radius:6px;',
+    'cursor:pointer;white-space:nowrap;}',
+    '#dsh-engine-btn:hover{opacity:1;background:rgba(127,127,127,.16);}',
+    '#dsh-engine-btn:disabled{opacity:.5;cursor:default;}',
+    '#dsh-engine-btn .dsh-spin{display:inline-block;width:10px;height:10px;border:2px solid currentColor;',
+    'border-top-color:transparent;border-radius:50%;animation:dsh-spin .8s linear infinite;}',
+    '@keyframes dsh-spin{to{transform:rotate(360deg)}}',
+    '#dsh-engine-pop{position:fixed;z-index:2147483647;max-width:min(320px,52vw);padding:7px 10px;',
+    'box-sizing:border-box;font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
+    'color:#e8eaf0;background:#1f2430;border:1px solid #2c3342;border-radius:8px;',
+    'box-shadow:0 8px 24px rgba(0,0,0,.34);white-space:pre-wrap;}',
+    '#dsh-engine-pop[hidden]{display:none;}',
+    '#dsh-engine-pop .dsh-ok{color:#6ee7a8;}',
+    '#dsh-engine-pop .dsh-bad{color:#ff9a9a;}'
   ].join('');
   document.documentElement.appendChild(style);
 
-  const bar = document.createElement('div');
-  bar.id = 'dsh-engine-bar';
-  const ver = document.createElement('span');
-  ver.className = 'dsh-ver';
-  const msg = document.createElement('span');
-  msg.className = 'dsh-msg';
-  const grow = document.createElement('span');
-  grow.className = 'dsh-grow';
-  const track = document.createElement('span');
-  track.className = 'dsh-track';
-  track.hidden = true;
-  const fill = document.createElement('span');
-  fill.className = 'dsh-fill';
-  track.appendChild(fill);
   const button = document.createElement('button');
-  button.textContent = '更新引擎';
-  bar.append(ver, msg, grow, track, button);
-  document.body.appendChild(bar);
+  button.id = 'dsh-engine-btn';
+  button.type = 'button';
+  const pop = document.createElement('div');
+  pop.id = 'dsh-engine-pop';
+  pop.hidden = true;
+  pop.addEventListener('click', () => { pop.hidden = true; });
+  document.body.appendChild(pop);
+
+  const row = () => document.querySelector('[class*="logoRow"]');
+  function attach() {
+    const target = row();
+    if (target === null) return false;
+    if (button.parentElement === target) return true;
+    // Before the collapse toggle, so the control sits with the logo rather
+    // than after the row's last button.
+    if (target.lastElementChild !== null) target.insertBefore(button, target.lastElementChild);
+    else target.appendChild(button);
+    return true;
+  }
 
   const formatSpeed = (bytesPerSecond) => bytesPerSecond >= 1048576
     ? (bytesPerSecond / 1048576).toFixed(1) + ' MB/s'
@@ -2907,46 +2911,61 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
 
   let announced = false;
   async function poll() {
+    if (!attach() && !document.body.contains(button)) document.body.appendChild(button);
+    const target = row();
+    if (target !== null) {
+      const rect = target.getBoundingClientRect();
+      pop.style.left = Math.round(rect.left) + 'px';
+      pop.style.top = Math.round(rect.bottom + 6) + 'px';
+    }
     try {
       const status = await invoke('engine_status');
-      ver.textContent = status.version ? 'dsh ' + status.version : 'dsh —';
-      bar.title = status.prefix ? '安装位置：' + status.prefix : '';
       button.disabled = !!status.running;
-      button.textContent = status.running ? '更新中…' : '更新引擎';
-      track.hidden = !status.running;
-      fill.className = status.running ? 'dsh-fill run' : 'dsh-fill';
+      button.title = (status.version ? 'dsh ' + status.version : 'dsh')
+        + (status.prefix ? '\n安装位置：' + status.prefix : '');
+      button.textContent = '';
       if (status.running) {
-        msg.className = 'dsh-msg';
-        msg.textContent = readout(status);
-      } else if (status.result) {
-        msg.className = status.failed ? 'dsh-msg bad' : 'dsh-msg ok';
-        msg.textContent = status.result;
+        const spinner = document.createElement('span');
+        spinner.className = 'dsh-spin';
+        button.appendChild(spinner);
+        button.appendChild(document.createTextNode('更新中'));
+        pop.className = '';
+        pop.textContent = readout(status);
+        pop.hidden = false;
       } else {
-        msg.className = 'dsh-msg';
-        msg.textContent = status.owned ? '' : '引擎由外部进程启动';
+        button.appendChild(document.createTextNode('更新引擎'));
+        if (status.result) {
+          pop.className = status.failed ? 'dsh-bad' : 'dsh-ok';
+          pop.textContent = status.result + '\n（点击关闭）';
+          pop.hidden = false;
+        }
       }
       if (!announced) {
         announced = true;
         invoke('toolbar_ready', { version: status.version || 'unknown' }).catch(() => {});
       }
     } catch (error) {
-      msg.className = 'dsh-msg bad';
-      msg.textContent = '无法读取引擎状态：' + String(error);
+      button.disabled = false;
+      pop.className = 'dsh-bad';
+      pop.textContent = '无法读取引擎状态：' + String(error);
+      pop.hidden = false;
     }
     timer = setTimeout(poll, 1200);
   }
 
   let timer = null;
-  button.addEventListener('click', async () => {
+  button.addEventListener('click', async (event) => {
+    event.stopPropagation();
     button.disabled = true;
-    msg.className = 'dsh-msg';
-    msg.textContent = '正在启动更新…';
+    pop.className = '';
+    pop.textContent = '正在启动更新…';
+    pop.hidden = false;
     try {
       await invoke('engine_update');
     } catch (error) {
       button.disabled = false;
-      msg.className = 'dsh-msg bad';
-      msg.textContent = String(error);
+      pop.className = 'dsh-bad';
+      pop.textContent = String(error);
     }
   });
 
