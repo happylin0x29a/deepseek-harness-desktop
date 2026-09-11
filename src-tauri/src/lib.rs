@@ -2544,6 +2544,40 @@ fn toolbar_ready(version: String) {
     log_line(&format!("engine toolbar ready on the engine page (dsh {version})"));
 }
 
+/// The window is undecorated, so its chrome is drawn inside the page and driven
+/// through these. They exist instead of granting the page `core:window:*`:
+/// adding an app command to the manifest is a narrower grant than handing a
+/// remote origin the window plugin's whole permission surface.
+fn window_error(error: tauri::Error) -> String {
+    error.to_string()
+}
+
+#[tauri::command]
+fn window_drag(window: WebviewWindow) -> Result<(), String> {
+    window.start_dragging().map_err(window_error)
+}
+
+#[tauri::command]
+fn window_minimize(window: WebviewWindow) -> Result<(), String> {
+    window.minimize().map_err(window_error)
+}
+
+#[tauri::command]
+fn window_toggle_maximize(window: WebviewWindow) -> Result<(), String> {
+    if window.is_maximized().unwrap_or(false) {
+        window.unmaximize().map_err(window_error)
+    } else {
+        window.maximize().map_err(window_error)
+    }
+}
+
+/// Closing goes through the same path as the native button: the shell hides to
+/// the tray and only the tray's quit item ends the process.
+#[tauri::command]
+fn window_close(window: WebviewWindow) -> Result<(), String> {
+    window.close().map_err(window_error)
+}
+
 /// Replace a field of the update view, ignoring a poisoned mutex.
 fn set_engine_update(state: &DesktopState, edit: impl FnOnce(&mut EngineUpdateState)) {
     if let Ok(mut guard) = state.engine_update.lock() {
@@ -2821,26 +2855,30 @@ fn restart_owned_host(app: &tauri::AppHandle) {
     spawn_host(app);
 }
 
-/// The engine button the shell injects into the engine's own page.
+/// The window chrome and the engine button, drawn into whichever page the
+/// window is showing.
 ///
-/// The desktop window shows a page the *engine* serves, so a shell-owned
-/// control has nowhere to live except inside that document. It goes into the
-/// sidebar's brand row — `[class*="logoRow"]`, the strip holding the logo and
-/// the collapse toggle — because that is the window's top-left corner and the
-/// row is already a flex container with a gap, so an extra child simply flows
-/// in. Nothing is overlaid on the app's own layout and nothing is pushed
-/// around.
+/// The window is **undecorated** (`decorations: false`): Windows draws nothing
+/// into a native caption that a webview can host, and neither Tauri nor wry
+/// exposes the WebView2 title-bar overlay, so the only way to put a control at
+/// the window's top-left — beside the app icon — is to draw the whole caption.
+/// This bar is that caption: icon and the engine button on the left, the
+/// minimize / maximize / close buttons on the right, drag on the strip and
+/// double-click to maximize, matching what the native bar did.
 ///
-/// React owns that row, so a re-render can drop the button; the poll below
-/// re-attaches it whenever it goes missing. The status popover is positioned
-/// from the row's own rectangle rather than inserted into it, so it never
-/// disturbs the layout it reports on.
+/// It rides on both pages. The splash needs it too, or an undecorated window
+/// could not be moved or closed while it loads. `window.__dshEnginePage`, set
+/// by the injector, says whether the engine half applies.
+///
+/// The window commands are the shell's own — see `window_drag` and friends —
+/// so the remote engine page never needs a `core:window:*` permission.
 ///
 /// Every failure inside this script is contained: if the IPC bridge is missing
-/// the popover says so and the engine keeps working, because the shell never
+/// the popover says so and the page keeps working, because the shell never
 /// depends on the page it decorates.
 const ENGINE_TOOLBAR_SCRIPT: &str = r##"
 (() => {
+  const isEnginePage = window.__dshEnginePage === true;
   const invoke = (cmd, args) => {
     const core = window.__TAURI__ && window.__TAURI__.core;
     if (core && core.invoke) return core.invoke(cmd, args);
@@ -2848,50 +2886,109 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
     if (internals && internals.invoke) return internals.invoke(cmd, args);
     return Promise.reject(new Error('桌面外壳的 IPC 通道不可用'));
   };
-  if (window.__dshEngineBar) { window.__dshEngineBar.poll(); return; }
+  if (window.__dshChrome) { window.__dshChrome.poll(); return; }
 
+  const HEIGHT = 32;
   const style = document.createElement('style');
   style.textContent = [
-    '#dsh-engine-btn{display:inline-flex;align-items:center;gap:5px;flex:none;height:24px;padding:0 8px;',
-    'box-sizing:border-box;font:12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
-    'color:inherit;opacity:.72;background:transparent;border:1px solid currentColor;border-radius:6px;',
-    'cursor:pointer;white-space:nowrap;}',
-    '#dsh-engine-btn:hover{opacity:1;background:rgba(127,127,127,.16);}',
-    '#dsh-engine-btn:disabled{opacity:.5;cursor:default;}',
+    'html{height:100%;}',
+    'body{height:calc(100% - ' + HEIGHT + 'px) !important;margin-top:' + HEIGHT + 'px !important;}',
+    '#dsh-titlebar{position:fixed;top:0;left:0;right:0;height:' + HEIGHT + 'px;display:flex;align-items:center;',
+    'z-index:2147483647;user-select:none;background:#1f2430;color:#e8eaf0;border-bottom:1px solid #2c3342;',
+    'font:12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;}',
+    '#dsh-titlebar .dsh-logo{width:16px;height:16px;margin:0 8px 0 10px;flex:none;}',
+    '#dsh-titlebar .dsh-caption{opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+    '#dsh-titlebar .dsh-grow{flex:1;min-width:12px;align-self:stretch;}',
+    '#dsh-titlebar button{-webkit-appearance:none;appearance:none;font:inherit;border:0;background:transparent;',
+    'color:inherit;cursor:default;}',
+    '#dsh-engine-btn{display:inline-flex;align-items:center;gap:5px;flex:none;height:22px;margin-right:8px;',
+    'padding:0 9px;border:1px solid rgba(232,234,240,.45) !important;border-radius:6px;cursor:pointer !important;',
+    'opacity:.9;}',
+    '#dsh-engine-btn:hover{background:rgba(255,255,255,.12) !important;opacity:1;}',
+    '#dsh-engine-btn:disabled{opacity:.5;}',
     '#dsh-engine-btn .dsh-spin{display:inline-block;width:10px;height:10px;border:2px solid currentColor;',
     'border-top-color:transparent;border-radius:50%;animation:dsh-spin .8s linear infinite;}',
     '@keyframes dsh-spin{to{transform:rotate(360deg)}}',
-    '#dsh-engine-pop{position:fixed;z-index:2147483647;max-width:min(320px,52vw);padding:7px 10px;',
-    'box-sizing:border-box;font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
-    'color:#e8eaf0;background:#1f2430;border:1px solid #2c3342;border-radius:8px;',
-    'box-shadow:0 8px 24px rgba(0,0,0,.34);white-space:pre-wrap;}',
+    '#dsh-titlebar .dsh-sys{width:46px;height:' + HEIGHT + 'px;display:flex;align-items:center;justify-content:center;',
+    'font-family:"Segoe Fluent Icons","Segoe MDL2 Assets",sans-serif;font-size:10px;cursor:default !important;}',
+    '#dsh-titlebar .dsh-sys:hover{background:rgba(255,255,255,.12) !important;}',
+    '#dsh-titlebar .dsh-sys.dsh-close:hover{background:#c42b1c !important;}',
+    '#dsh-engine-pop{position:fixed;z-index:2147483647;max-width:min(340px,52vw);padding:7px 10px;box-sizing:border-box;',
+    'font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#e8eaf0;',
+    'background:#1f2430;border:1px solid #2c3342;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.34);',
+    'white-space:pre-wrap;}',
     '#dsh-engine-pop[hidden]{display:none;}',
     '#dsh-engine-pop .dsh-ok{color:#6ee7a8;}',
     '#dsh-engine-pop .dsh-bad{color:#ff9a9a;}'
   ].join('');
   document.documentElement.appendChild(style);
 
-  const button = document.createElement('button');
-  button.id = 'dsh-engine-btn';
-  button.type = 'button';
+  const bar = document.createElement('div');
+  bar.id = 'dsh-titlebar';
+  const logo = document.createElement('img');
+  logo.className = 'dsh-logo';
+  logo.alt = '';
+  logo.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#111"/>'
+    + '<path d="M6 19c2.4-4.2 5.6-6.3 9.6-6.3 2.6 0 4.6.9 6.1 2.6l4.3-2.2-1.9 4.4c.3 1.2.4 2.4.3 3.5H6z" fill="#fff"/>'
+    + '<circle cx="12.4" cy="16.2" r="1.3" fill="#111"/></svg>');
+  if (isEnginePage) {
+    const button = document.createElement('button');
+    button.id = 'dsh-engine-btn';
+    button.type = 'button';
+    button.textContent = '更新引擎';
+    bar.append(logo, button);
+  } else {
+    bar.appendChild(logo);
+  }
+  const caption = document.createElement('span');
+  caption.className = 'dsh-caption';
+  caption.textContent = 'DeepSeek Harness';
+  const grow = document.createElement('span');
+  grow.className = 'dsh-grow';
+  bar.append(caption, grow);
+
+  const sysButton = (glyph, label, className) => {
+    const element = document.createElement('button');
+    element.className = 'dsh-sys' + (className === undefined ? '' : ' ' + className);
+    element.type = 'button';
+    element.textContent = glyph;
+    element.title = label;
+    element.setAttribute('aria-label', label);
+    return element;
+  };
+  const minimize = sysButton('\uE921', '最小化');
+  const maximize = sysButton('\uE922', '最大化');
+  const close = sysButton('\uE8BB', '关闭', 'dsh-close');
+  bar.append(minimize, maximize, close);
+  document.body.appendChild(bar);
+
   const pop = document.createElement('div');
   pop.id = 'dsh-engine-pop';
   pop.hidden = true;
   pop.addEventListener('click', () => { pop.hidden = true; });
   document.body.appendChild(pop);
 
-  const row = () => document.querySelector('[class*="logoRow"]');
-  function attach() {
-    const target = row();
-    if (target === null) return false;
-    if (button.parentElement === target) return true;
-    // Before the collapse toggle, so the control sits with the logo rather
-    // than after the row's last button.
-    if (target.lastElementChild !== null) target.insertBefore(button, target.lastElementChild);
-    else target.appendChild(button);
-    return true;
-  }
+  const placePopup = () => {
+    pop.style.left = '10px';
+    pop.style.top = HEIGHT + 6 + 'px';
+  };
 
+  minimize.addEventListener('click', () => { invoke('window_minimize').catch(() => {}); });
+  close.addEventListener('click', () => { invoke('window_close').catch(() => {}); });
+  maximize.addEventListener('click', () => {
+    invoke('window_toggle_maximize').catch(() => {}).then(() => {});
+  });
+  bar.addEventListener('mousedown', (event) => {
+    if (event.button !== 0 || event.target.closest('button') !== null) return;
+    invoke('window_drag').catch(() => {});
+  });
+  bar.addEventListener('dblclick', (event) => {
+    if (event.target.closest('button') !== null) return;
+    invoke('window_toggle_maximize').catch(() => {});
+  });
+
+  const engineButton = document.getElementById('dsh-engine-btn');
   const formatSpeed = (bytesPerSecond) => bytesPerSecond >= 1048576
     ? (bytesPerSecond / 1048576).toFixed(1) + ' MB/s'
     : Math.max(0, Math.round(bytesPerSecond / 1024)) + ' KB/s';
@@ -2911,30 +3008,27 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
 
   let announced = false;
   async function poll() {
-    if (!attach() && !document.body.contains(button)) document.body.appendChild(button);
-    const target = row();
-    if (target !== null) {
-      const rect = target.getBoundingClientRect();
-      pop.style.left = Math.round(rect.left) + 'px';
-      pop.style.top = Math.round(rect.bottom + 6) + 'px';
-    }
+    if (!isEnginePage || engineButton === null) return;
     try {
       const status = await invoke('engine_status');
-      button.disabled = !!status.running;
-      button.title = (status.version ? 'dsh ' + status.version : 'dsh')
+      engineButton.disabled = !!status.running;
+      bar.title = (status.version ? 'dsh ' + status.version : 'dsh')
         + (status.prefix ? '\n安装位置：' + status.prefix : '');
-      button.textContent = '';
+      engineButton.textContent = '';
       if (status.running) {
         const spinner = document.createElement('span');
         spinner.className = 'dsh-spin';
-        button.appendChild(spinner);
-        button.appendChild(document.createTextNode('更新中'));
+        engineButton.appendChild(spinner);
+        engineButton.appendChild(document.createTextNode('更新中'));
+        placePopup();
         pop.className = '';
         pop.textContent = readout(status);
         pop.hidden = false;
       } else {
-        button.appendChild(document.createTextNode('更新引擎'));
+        engineButton.appendChild(document.createTextNode('更新引擎'));
+        caption.textContent = status.version ? 'DeepSeek Harness · dsh ' + status.version : 'DeepSeek Harness';
         if (status.result) {
+          placePopup();
           pop.className = status.failed ? 'dsh-bad' : 'dsh-ok';
           pop.textContent = status.result + '\n（点击关闭）';
           pop.hidden = false;
@@ -2945,7 +3039,7 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
         invoke('toolbar_ready', { version: status.version || 'unknown' }).catch(() => {});
       }
     } catch (error) {
-      button.disabled = false;
+      placePopup();
       pop.className = 'dsh-bad';
       pop.textContent = '无法读取引擎状态：' + String(error);
       pop.hidden = false;
@@ -2954,22 +3048,24 @@ const ENGINE_TOOLBAR_SCRIPT: &str = r##"
   }
 
   let timer = null;
-  button.addEventListener('click', async (event) => {
-    event.stopPropagation();
-    button.disabled = true;
-    pop.className = '';
-    pop.textContent = '正在启动更新…';
-    pop.hidden = false;
-    try {
-      await invoke('engine_update');
-    } catch (error) {
-      button.disabled = false;
-      pop.className = 'dsh-bad';
-      pop.textContent = String(error);
-    }
-  });
+  if (engineButton !== null) {
+    engineButton.addEventListener('click', async () => {
+      engineButton.disabled = true;
+      placePopup();
+      pop.className = '';
+      pop.textContent = '正在启动更新…';
+      pop.hidden = false;
+      try {
+        await invoke('engine_update');
+      } catch (error) {
+        engineButton.disabled = false;
+        pop.className = 'dsh-bad';
+        pop.textContent = String(error);
+      }
+    });
+  }
 
-  window.__dshEngineBar = { poll: () => { if (timer !== null) clearTimeout(timer); poll(); } };
+  window.__dshChrome = { poll: () => { if (timer !== null) clearTimeout(timer); poll(); } };
   poll();
 })();
 "##;
@@ -3060,20 +3156,21 @@ pub fn run() {
             }
             Ok(())
         })
-        // Decorate the engine's own page with the toolbar on every load, the
-        // splash page excepted: the shell's loading UI is already its own.
-        // The page is a *remote* origin to Tauri, so `capabilities/
-        // engine-surface.json` is what lets its IPC through.
+        // Draw the window chrome on every page the window shows. The window is
+        // undecorated, so the splash needs it too — otherwise it could neither
+        // be moved nor closed while it loads. Only the engine's own page gets
+        // the engine half of the bar, and that page is a *remote* origin to
+        // Tauri, so `capabilities/engine-surface.json` is what lets its IPC
+        // through.
         .on_page_load(|webview, payload| {
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                 return;
             }
-            let url = payload.url().as_str();
-            if !is_local_web_url(url) {
-                return;
-            }
-            if let Err(error) = webview.eval(ENGINE_TOOLBAR_SCRIPT) {
-                log_line(&format!("could not inject the engine toolbar: {error}"));
+            let engine_page = is_local_web_url(payload.url().as_str());
+            let script =
+                format!("window.__dshEnginePage = {engine_page};\n{ENGINE_TOOLBAR_SCRIPT}");
+            if let Err(error) = webview.eval(script) {
+                log_line(&format!("could not inject the window chrome: {error}"));
             }
         })
         .on_window_event(|window, event| {
@@ -3090,7 +3187,11 @@ pub fn run() {
             startup_status,
             engine_status,
             engine_update,
-            toolbar_ready
+            toolbar_ready,
+            window_drag,
+            window_minimize,
+            window_toggle_maximize,
+            window_close
         ])
         .build(tauri::generate_context!())
         .expect("error while building the desktop shell");

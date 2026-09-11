@@ -15,7 +15,8 @@
         "width": 460,
         "height": 300,
         "center": true,
-        "url": "index.html"
+        "url": "index.html",
+        "decorations": false
       }
     ],
     "security": {

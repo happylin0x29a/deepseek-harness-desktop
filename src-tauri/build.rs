@@ -10,6 +10,14 @@ fn main() {
                 "engine_status",
                 "engine_update",
                 "toolbar_ready",
+                // The window is undecorated, so its chrome is drawn by the
+                // injected title bar and driven through the shell's own
+                // commands — the remote engine page never needs a
+                // `core:window:*` permission for them.
+                "window_drag",
+                "window_minimize",
+                "window_toggle_maximize",
+                "window_close",
             ]),
         ),
     )

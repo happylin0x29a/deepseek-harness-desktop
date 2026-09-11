@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "engine-surface",
-  "description": "The engine's own page is served by `dsh web` over loopback, so Tauri sees it as a *remote* origin and no capability covers it by default. This one grants exactly the engine toolbar's three commands — the status poll, the update trigger, and the readiness ping — and no core or plugin permission at all.",
+  "description": "The engine's own page is served by `dsh web` over loopback, so Tauri sees it as a *remote* origin and no capability covers it by default. This one grants the engine toolbar and the window chrome drawn into the same document: the status poll, the update trigger, the readiness ping, and the four window commands the title bar needs — with no core or plugin permission at all.",
   "windows": ["main"],
   "local": false,
   "remote": {
@@ -10,6 +10,10 @@
   "permissions": [
     "allow-engine-status",
     "allow-engine-update",
-    "allow-toolbar-ready"
+    "allow-toolbar-ready",
+    "allow-window-drag",
+    "allow-window-minimize",
+    "allow-window-toggle-maximize",
+    "allow-window-close"
   ]
 }

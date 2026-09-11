@@ -1,10 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for the local splash page: core events and window APIs, plus the startup-status poll it renders. The engine's own page is a remote origin and is covered by the `engine-surface` capability instead.",
+  "description": "Capabilities for the local splash page: core events and window APIs plus the startup-status poll it renders, and the drawn title bar's window commands — the same chrome rides on both pages. The engine's own page is a remote origin and is covered by `engine-surface` instead.",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "allow-startup-status"
+    "allow-startup-status",
+    "allow-window-drag",
+    "allow-window-minimize",
+    "allow-window-toggle-maximize",
+    "allow-window-close"
   ]
 }
